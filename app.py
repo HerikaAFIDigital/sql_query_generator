@@ -1,291 +1,5 @@
-# import os
-# import asyncio
-
-# from dotenv import load_dotenv
-# import psycopg2
-
-# from vanna import Agent
-# from vanna.core.registry import ToolRegistry
-# from vanna.core.user import User
-# from vanna.core.user.resolver import UserResolver
-# from vanna.core.user.request_context import RequestContext
-# from vanna.core.lifecycle import LifecycleHook
-# from vanna.core.enhancer import LlmContextEnhancer
-# from vanna.integrations.ollama import OllamaLlmService
-# from vanna.integrations.postgres import PostgresRunner
-# from vanna.integrations.local.agent_memory import DemoAgentMemory
-# from vanna.tools import RunSqlTool
-
-
-# # --------------------------------------------------
-# # Load environment variables
-# # --------------------------------------------------
-
-# load_dotenv()
-
-# PG_KWARGS = dict(
-#     host=os.getenv("POSTGRES_HOST", "localhost"),
-#     port=int(os.getenv("POSTGRES_PORT", "5432")),
-#     database=os.getenv("POSTGRES_DATABASE", "vanna_demo"),
-#     user=os.getenv("POSTGRES_USER", "vanna_readonly"),
-#     password=os.getenv("POSTGRES_PASSWORD"),
-# )
-
-# # Add every table you want the model to know about here.
-# KNOWN_TABLES = ["onboarding_events"]
-
-
-# # --------------------------------------------------
-# # 1. Ollama
-# # --------------------------------------------------
-
-# llm = OllamaLlmService(
-#     model=os.getenv("OLLAMA_MODEL", "qwen3:14b"),
-#     host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-# )
-
-
-# # --------------------------------------------------
-# # 2. PostgreSQL
-# # --------------------------------------------------
-
-# db = PostgresRunner(**PG_KWARGS)
-
-
-# # --------------------------------------------------
-# # 3. SQL tool
-# # --------------------------------------------------
-
-# sql_tool = RunSqlTool(
-#     sql_runner=db
-# )
-
-
-# # --------------------------------------------------
-# # 4. Tool registry
-# # --------------------------------------------------
-
-# tools = ToolRegistry()
-
-# tools.register_local_tool(
-#     sql_tool,
-#     access_groups=["user"]
-# )
-
-
-# # --------------------------------------------------
-# # 5. User resolver
-# # --------------------------------------------------
-
-# class SimpleUserResolver(UserResolver):
-
-#     async def resolve_user(self, request):
-#         return User(
-#             id="local-user",
-#             username="local-user",
-#             group_memberships=["user"],
-#         )
-
-
-# user_resolver = SimpleUserResolver()
-
-
-# # --------------------------------------------------
-# # 6. Agent memory
-# # --------------------------------------------------
-
-# agent_memory = DemoAgentMemory()
-
-
-# # --------------------------------------------------
-# # 7. Schema-awareness: teach the LLM columns AND their real values
-# # --------------------------------------------------
-
-# TEXT_TYPES = ("text", "character varying", "varchar", "char", "character")
-
-
-# class SchemaEnhancer(LlmContextEnhancer):
-#     """Pulls real column names/types from Postgres, and for any low-cardinality
-#     text column (like an EAV question/answer column), also pulls the actual
-#     distinct values so the model doesn't have to guess them."""
-
-#     def __init__(self, pg_kwargs, tables, enum_threshold=50):
-#         self.pg_kwargs = pg_kwargs
-#         self.tables = tables
-#         self.enum_threshold = enum_threshold
-#         self._cache = None
-
-#     def _load_schema(self):
-#         if self._cache is not None:
-#             return self._cache
-#         try:
-#             conn = psycopg2.connect(**self.pg_kwargs)
-#             cur = conn.cursor()
-#             lines = []
-#             for table in self.tables:
-#                 cur.execute(
-#                     """
-#                     SELECT column_name, data_type
-#                     FROM information_schema.columns
-#                     WHERE table_name = %s
-#                     ORDER BY ordinal_position
-#                     """,
-#                     (table,),
-#                 )
-#                 cols = cur.fetchall()
-#                 if not cols:
-#                     lines.append(f"- {table}: (no columns found — check the table name)")
-#                     continue
-
-#                 col_parts = []
-#                 for name, dtype in cols:
-#                     part = f"{name} ({dtype})"
-#                     if dtype in TEXT_TYPES:
-#                         cur.execute(f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"')
-#                         distinct_count = cur.fetchone()[0]
-#                         if 0 < distinct_count <= self.enum_threshold:
-#                             cur.execute(f'SELECT DISTINCT "{name}" FROM "{table}" ORDER BY 1')
-#                             values = [str(r[0]) for r in cur.fetchall()]
-#                             values_str = ", ".join(f"'{v}'" for v in values)
-#                             part += f" [actual values: {values_str}]"
-#                     col_parts.append(part)
-
-#                 lines.append(f"- {table}({', '.join(col_parts)})")
-
-#             cur.close()
-#             conn.close()
-#             self._cache = "\n".join(lines)
-#         except Exception as exc:
-#             self._cache = f"(schema lookup failed: {exc})"
-#         return self._cache
-
-#     async def enhance_system_prompt(self, system_prompt, user_message, user):
-#         schema = self._load_schema()
-#         return (
-#             system_prompt
-#             + "\n\n## Database schema (this is the ONLY schema that exists)\n"
-#             + schema
-#             + "\n\n## Important notes on this schema\n"
-#               "- `onboarding_events` stores ONE ROW PER QUESTION a user (profile_id) answered.\n"
-#               "- Despite the column names, `question_id` holds the FULL TEXT of the question "
-#               "(not a numeric id), and `answer_id` holds the literal answer text (not a numeric id).\n"
-#               "- To count how many users gave a specific answer to a specific question, filter with "
-#               "an exact string match on BOTH `question_id` and `answer_id`, then "
-#               "COUNT(DISTINCT profile_id). Example:\n"
-#               "  SELECT COUNT(DISTINCT profile_id) FROM onboarding_events "
-#               "WHERE question_id = 'Is this device a shared phone/tablet?' AND answer_id = 'yes';\n"
-#               "- Only use the exact question/answer strings listed in the schema above — never "
-#               "paraphrase or guess the wording.\n"
-#         )
-
-#     async def enhance_user_messages(self, messages, user):
-#         return messages
-
-
-# schema_enhancer = SchemaEnhancer(PG_KWARGS, KNOWN_TABLES)
-
-
-# # --------------------------------------------------
-# # 8. Debug hook: prints the real error/result if a tool call fails
-# # --------------------------------------------------
-
-# class DebugHook(LifecycleHook):
-
-#     async def before_tool(self, tool, context):
-#         print(f"\n[DEBUG] Calling tool: {tool.name}")
-#         try:
-#             print(f"[DEBUG] context: {vars(context)}")
-#         except Exception:
-#             pass
-
-#     async def after_tool(self, result):
-#         print(f"\n[DEBUG] Tool finished. success={getattr(result, 'success', None)}")
-#         try:
-#             print(f"[DEBUG] full result: {vars(result)}")
-#         except Exception:
-#             print(f"[DEBUG] result repr: {result!r}")
-#         return None
-
-
-# # --------------------------------------------------
-# # 9. Vanna Agent
-# # --------------------------------------------------
-
-# agent = Agent(
-#     llm_service=llm,
-#     tool_registry=tools,
-#     user_resolver=user_resolver,
-#     agent_memory=agent_memory,
-#     llm_context_enhancer=schema_enhancer,
-#     lifecycle_hooks=[DebugHook()],
-# )
-
-
-# # --------------------------------------------------
-# # 10. Startup information
-# # --------------------------------------------------
-
-# print("Vanna agent created successfully.")
-# print("Ollama model:", os.getenv("OLLAMA_MODEL", "qwen3:14b"))
-# print("Database:", os.getenv("POSTGRES_DATABASE", "vanna_demo"))
-# print("Database user:", os.getenv("POSTGRES_USER", "vanna_readonly"))
-# print("Ready.")
-
-
-# # --------------------------------------------------
-# # 11. Test natural-language query
-# # --------------------------------------------------
-
-# async def main():
-
-#     request_context = RequestContext(
-#         metadata={
-#             "user_id": "local-user"
-#         }
-#     )
-
-#     question = "How many users said yes to the shared phone question?"
-
-#     print("\nUser question:")
-#     print(question)
-
-#     print("\nAsking Vanna...\n")
-
-#     async for component in agent.send_message(
-#         request_context,
-#         question
-#     ):
-#         print("\n--- COMPONENT ---")
-#         print(component)
-
-#         if hasattr(component, "model_dump"):
-#             print("MODEL DUMP:")
-#             print(component.model_dump())
-
-#         if hasattr(component, "metadata"):
-#             print("METADATA:")
-#             print(component.metadata)
-
-#         if hasattr(component, "simple_component"):
-#             print("SIMPLE:")
-#             print(component.simple_component)
-
-#         if hasattr(component, "rich_component"):
-#             print("RICH:")
-#             print(component.rich_component)
-
-
-# # --------------------------------------------------
-# # 12. Run
-# # --------------------------------------------------
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
-
-
 import os
 import asyncio
-
 from dotenv import load_dotenv
 import psycopg2
 
@@ -300,12 +14,11 @@ from vanna.integrations.ollama import OllamaLlmService
 from vanna.integrations.postgres import PostgresRunner
 from vanna.integrations.local.agent_memory import DemoAgentMemory
 from vanna.tools import RunSqlTool
-
+from journey_engine import UserJourneyEngine, parse_journey_query
 
 # --------------------------------------------------
 # Load environment variables
 # --------------------------------------------------
-
 load_dotenv()
 
 PG_KWARGS = dict(
@@ -316,76 +29,6 @@ PG_KWARGS = dict(
     password=os.getenv("POSTGRES_PASSWORD"),
 )
 
-# Add every table you want the model to know about here.
-KNOWN_TABLES = ["onboarding_events"]
-
-
-# --------------------------------------------------
-# 1. Ollama
-# --------------------------------------------------
-
-llm = OllamaLlmService(
-    model=os.getenv("OLLAMA_MODEL", "qwen3:14b"),
-    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-)
-
-
-# --------------------------------------------------
-# 2. PostgreSQL
-# --------------------------------------------------
-
-db = PostgresRunner(**PG_KWARGS)
-
-
-# --------------------------------------------------
-# 3. SQL tool
-# --------------------------------------------------
-
-sql_tool = RunSqlTool(
-    sql_runner=db
-)
-
-
-# --------------------------------------------------
-# 4. Tool registry
-# --------------------------------------------------
-
-tools = ToolRegistry()
-
-tools.register_local_tool(
-    sql_tool,
-    access_groups=["user"]
-)
-
-
-# --------------------------------------------------
-# 5. User resolver
-# --------------------------------------------------
-
-class SimpleUserResolver(UserResolver):
-
-    async def resolve_user(self, request):
-        return User(
-            id="local-user",
-            username="local-user",
-            group_memberships=["user"],
-        )
-
-
-user_resolver = SimpleUserResolver()
-
-
-# --------------------------------------------------
-# 6. Agent memory
-# --------------------------------------------------
-
-agent_memory = DemoAgentMemory()
-
-
-# --------------------------------------------------
-# 7. Schema-awareness
-# --------------------------------------------------
-
 TEXT_TYPES = (
     "text",
     "character varying",
@@ -394,249 +37,158 @@ TEXT_TYPES = (
     "character",
 )
 
+# --------------------------------------------------
+# 1. Ollama LLM Service
+# --------------------------------------------------
+llm = OllamaLlmService(
+    model=os.getenv("OLLAMA_MODEL", "qwen3:8b"),
+    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+    temperature=0.1,
+)
 
-class SchemaEnhancer(LlmContextEnhancer):
-    """
-    Pulls real column names/types from Postgres.
+# --------------------------------------------------
+# 2. PostgreSQL Runner & SQL Tool
+# --------------------------------------------------
+db = PostgresRunner(**PG_KWARGS)
+sql_tool = RunSqlTool(sql_runner=db)
 
-    For low-cardinality text columns, also pulls the
-    actual distinct values so the model doesn't have
-    to guess them.
-    """
+# --------------------------------------------------
+# 3. Tool Registry
+# --------------------------------------------------
+tools = ToolRegistry()
+tools.register_local_tool(sql_tool, access_groups=["user"])
 
-    def __init__(
-        self,
-        pg_kwargs,
-        tables,
-        enum_threshold=50
-    ):
+
+# --------------------------------------------------
+# 4. User Resolver & Memory
+# --------------------------------------------------
+class SimpleUserResolver(UserResolver):
+    async def resolve_user(self, request_context):
+        return User(
+            id="local-user",
+            username="local-user",
+            group_memberships=["user"],
+        )
+
+
+user_resolver = SimpleUserResolver()
+agent_memory = DemoAgentMemory()
+
+
+# --------------------------------------------------
+# 5. Dynamic Schema Enhancer
+# --------------------------------------------------
+class DynamicSchemaEnhancer(LlmContextEnhancer):
+    """Pulls real column names/types from Postgres dynamically across all production tables."""
+
+    _SKIP_ENUM_COLUMNS = {
+        "selected_categories", "selected_category_titles", "extra",
+        "id", "session_id", "app_installation_id", "category_id",
+        "language_id", "source_file", "ingested_at", "event_timestamp",
+    }
+
+    def __init__(self, pg_kwargs, enum_threshold=30):
         self.pg_kwargs = pg_kwargs
-        self.tables = tables
         self.enum_threshold = enum_threshold
         self._cache = None
 
-    def _load_schema(self):
+    def _discover_tables(self, cur):
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'
+            ORDER BY table_name
+        """)
+        return [r[0] for r in cur.fetchall()]
 
+    def _load_schema(self):
         if self._cache is not None:
             return self._cache
 
         conn = None
         cur = None
-
         try:
-
-            conn = psycopg2.connect(
-                **self.pg_kwargs
-            )
-
+            conn = psycopg2.connect(**self.pg_kwargs)
             cur = conn.cursor()
+            tables = self._discover_tables(cur)
 
             lines = []
-
-            for table in self.tables:
-
-                cur.execute(
-                    """
+            for table in tables:
+                cur.execute("""
                     SELECT column_name, data_type
                     FROM information_schema.columns
-                    WHERE table_name = %s
+                    WHERE table_name = %s AND table_schema = 'public'
                     ORDER BY ordinal_position
-                    """,
-                    (table,),
-                )
-
+                """, (table,))
                 cols = cur.fetchall()
-
                 if not cols:
-
-                    lines.append(
-                        f"- {table}: "
-                        "(no columns found — check the table name)"
-                    )
-
                     continue
 
                 col_parts = []
-
                 for name, dtype in cols:
-
                     part = f"{name} ({dtype})"
-
-                    if dtype in TEXT_TYPES:
-
-                        cur.execute(
-                            f'''
-                            SELECT COUNT(DISTINCT "{name}")
-                            FROM "{table}"
-                            '''
-                        )
-
-                        distinct_count = cur.fetchone()[0]
-
-                        if (
-                            0 < distinct_count
-                            <= self.enum_threshold
-                        ):
-
-                            cur.execute(
-                                f'''
-                                SELECT DISTINCT "{name}"
-                                FROM "{table}"
-                                ORDER BY 1
-                                '''
-                            )
-
-                            values = [
-                                str(r[0])
-                                for r in cur.fetchall()
-                            ]
-
-                            values_str = ", ".join(
-                                f"'{v}'"
-                                for v in values
-                            )
-
-                            part += (
-                                f" [actual values: {values_str}]"
-                            )
-
+                    if dtype in TEXT_TYPES and name not in self._SKIP_ENUM_COLUMNS and not table.startswith("v_"):
+                        try:
+                            cur.execute(f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"')
+                            row = cur.fetchone()
+                            distinct_count = row[0] if row is not None else None
+                            if distinct_count is not None and 0 < distinct_count <= self.enum_threshold:
+                                cur.execute(f'SELECT DISTINCT "{name}" FROM "{table}" WHERE "{name}" IS NOT NULL ORDER BY 1')
+                                values = [str(r[0]) for r in cur.fetchall()]
+                                values_str = ", ".join(f"'{v}'" for v in values)
+                                part += f" [values: {values_str}]"
+                        except Exception:
+                            pass
                     col_parts.append(part)
-
-                lines.append(
-                    f"- {table}({', '.join(col_parts)})"
-                )
+                lines.append(f"- {table}({', '.join(col_parts)})")
 
             self._cache = "\n".join(lines)
-
         except Exception as exc:
-
-            self._cache = (
-                f"(schema lookup failed: {exc})"
-            )
-
+            self._cache = f"(schema lookup failed: {exc})"
         finally:
-
             if cur is not None:
                 cur.close()
-
             if conn is not None:
                 conn.close()
 
         return self._cache
 
-    async def enhance_system_prompt(
-        self,
-        system_prompt,
-        user_message,
-        user
-    ):
-
+    async def enhance_system_prompt(self, system_prompt, user_message, user):
         schema = self._load_schema()
-
         return (
             system_prompt
-
-            + "\n\n## Database schema "
-              "(this is the ONLY schema that exists)\n"
-
+            + "\n\n## Database schema (PostgreSQL production data)\n"
             + schema
-
-            + "\n\n## Important notes on this schema\n"
-
-              "- `onboarding_events` stores ONE ROW PER QUESTION "
-              "a user (profile_id) answered.\n"
-
-              "- Despite the column names, `question_id` holds "
-              "the FULL TEXT of the question "
-              "(not a numeric id), and `answer_id` holds "
-              "the literal answer text "
-              "(not a numeric id).\n"
-
-              "- To count how many users gave a specific answer "
-              "to a specific question, filter with an exact "
-              "string match on BOTH `question_id` and `answer_id`, "
-              "then COUNT(DISTINCT profile_id).\n"
-
-              "- Example:\n"
-              "  SELECT COUNT(DISTINCT profile_id) "
-              "FROM onboarding_events "
-              "WHERE question_id = "
-              "'Is this device a shared phone/tablet?' "
-              "AND answer_id = 'yes';\n"
-
-              "- Only use the exact question/answer strings "
-              "listed in the schema above — never "
-              "paraphrase or guess the wording.\n"
+            + "\n\n## Important Guidelines\n"
+            + "- `profile_id` is the shared user identifier across all event tables.\n"
+            + "- `event_time` (timestamp) is the primary time column for date filtering.\n"
+            + "- Always use `COUNT(DISTINCT profile_id)` when counting users.\n"
+            + "- Use `v_all_events` when querying across all event tables.\n"
+            + "- In `onboarding_events`, `question_id` has the full text of the question, and `answer_id` is the literal answer.\n"
+            + "- Always execute SQL via `run_sql` and cite real numbers from the output.\n"
         )
 
-    async def enhance_user_messages(
-        self,
-        messages,
-        user
-    ):
+    async def enhance_user_messages(self, messages, user):
         return messages
 
 
-schema_enhancer = SchemaEnhancer(
-    PG_KWARGS,
-    KNOWN_TABLES
-)
+schema_enhancer = DynamicSchemaEnhancer(PG_KWARGS)
 
 
 # --------------------------------------------------
-# 8. Debug hook
+# 6. Debug Hook
 # --------------------------------------------------
-
 class DebugHook(LifecycleHook):
+    async def before_tool(self, tool, context):
+        print(f"\n[DEBUG] Calling tool: {tool.name}")
 
-    async def before_tool(
-        self,
-        tool,
-        context
-    ):
-
-        print(
-            f"\n[DEBUG] Calling tool: {tool.name}"
-        )
-
-        try:
-            print(
-                f"[DEBUG] context: {vars(context)}"
-            )
-        except Exception:
-            pass
-
-    async def after_tool(
-        self,
-        result
-    ):
-
-        print(
-            "\n[DEBUG] Tool finished. "
-            f"success={getattr(result, 'success', None)}"
-        )
-
-        try:
-
-            print(
-                f"[DEBUG] full result: "
-                f"{vars(result)}"
-            )
-
-        except Exception:
-
-            print(
-                f"[DEBUG] result repr: "
-                f"{result!r}"
-            )
-
+    async def after_tool(self, result):
+        print(f"[DEBUG] Tool finished. success={getattr(result, 'success', None)}")
         return None
 
 
 # --------------------------------------------------
-# 9. Vanna Agent
+# 7. Vanna Agent
 # --------------------------------------------------
-
 agent = Agent(
     llm_service=llm,
     tool_registry=tools,
@@ -646,131 +198,46 @@ agent = Agent(
     lifecycle_hooks=[DebugHook()],
 )
 
-
 # --------------------------------------------------
-# 10. Startup information
+# 8. User Journey Engine
 # --------------------------------------------------
+journey_engine = UserJourneyEngine(PG_KWARGS)
 
-print(
-    "Vanna agent created successfully."
-)
-
-print(
-    "Ollama model:",
-    os.getenv(
-        "OLLAMA_MODEL",
-        "qwen3:14b"
-    )
-)
-
-print(
-    "Database:",
-    os.getenv(
-        "POSTGRES_DATABASE",
-        "vanna_demo"
-    )
-)
-
-print(
-    "Database user:",
-    os.getenv(
-        "POSTGRES_USER",
-        "vanna_readonly"
-    )
-)
-
+print("Vanna agent created successfully.")
+print("Ollama model:", os.getenv("OLLAMA_MODEL", "qwen3:8b"))
+print("Database:", os.getenv("POSTGRES_DATABASE", "vanna_demo"))
 print("Ready.")
 
 
 # --------------------------------------------------
-# 11. Test natural-language query
+# 9. Main runner
 # --------------------------------------------------
-
 async def main():
+    available_dates = journey_engine.get_available_dates()
+    question = "Can you create a report of all the users of 2026-09-21 and show me their user journey?"
 
-    request_context = RequestContext(
-        metadata={
-            "user_id": "local-user"
-        }
-    )
+    print(f"\nUser question:\n{question}\n")
 
-    question = (
-        "How many users said yes "
-        "to the shared phone question?"
-    )
+    is_journey, target_date, target_pid = parse_journey_query(question, available_dates)
 
-    print("\nUser question:")
-    print(question)
+    if is_journey:
+        print(f"[Engine] Detected Journey Report request for date: {target_date or 'all'}")
+        rep = journey_engine.generate_journey_report(date_filter=target_date, profile_id=target_pid)
+        summary = journey_engine.generate_markdown_summary(rep)
+        print("\n=== JOURNEY REPORT SUMMARY ===")
+        print(summary)
+        html_out = "user_journey_report.html"
+        html_content = journey_engine.render_html_report(rep)
+        with open(html_out, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"\n[Engine] Saved standalone interactive HTML report ({len(html_content):,} bytes) -> {html_out}")
+    else:
+        request_context = RequestContext(metadata={"user_id": "local-user"})
+        print("Asking Vanna...")
+        async for component in agent.send_message(request_context, question):
+            if hasattr(component, "simple_component") and component.simple_component:
+                print(component.simple_component.text)
 
-    print("\nAsking Vanna...\n")
-
-    async for component in agent.send_message(
-        request_context,
-        question
-    ):
-
-        print(
-            "\n--- COMPONENT ---"
-        )
-
-        print(component)
-
-        if hasattr(
-            component,
-            "model_dump"
-        ):
-
-            print(
-                "MODEL DUMP:"
-            )
-
-            print(
-                component.model_dump()
-            )
-
-        if hasattr(
-            component,
-            "metadata"
-        ):
-
-            print(
-                "METADATA:"
-            )
-
-            print(
-                component.metadata
-            )
-
-        if hasattr(
-            component,
-            "simple_component"
-        ):
-
-            print(
-                "SIMPLE:"
-            )
-
-            print(
-                component.simple_component
-            )
-
-        if hasattr(
-            component,
-            "rich_component"
-        ):
-
-            print(
-                "RICH:"
-            )
-
-            print(
-                component.rich_component
-            )
-
-
-# --------------------------------------------------
-# 12. Run
-# --------------------------------------------------
 
 if __name__ == "__main__":
     asyncio.run(main())

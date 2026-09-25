@@ -1,3 +1,35 @@
+# import os
+# import psycopg2
+# from dotenv import load_dotenv
+
+# load_dotenv()
+
+# conn = psycopg2.connect(
+#     host=os.getenv("POSTGRES_HOST"),
+#     port=os.getenv("POSTGRES_PORT"),
+#     database=os.getenv("POSTGRES_DATABASE"),
+#     user=os.getenv("POSTGRES_USER"),
+#     password=os.getenv("POSTGRES_PASSWORD"),
+# )
+
+# cursor = conn.cursor()
+
+# cursor.execute("""
+#     SELECT *
+#     FROM onboarding_events
+    
+# """)
+
+# rows = cursor.fetchall()
+
+# for row in rows:
+#     print(row)
+
+# cursor.close()
+# conn.close()
+
+
+
 import os
 import psycopg2
 from dotenv import load_dotenv
@@ -8,22 +40,17 @@ conn = psycopg2.connect(
     host=os.getenv("POSTGRES_HOST"),
     port=os.getenv("POSTGRES_PORT"),
     database=os.getenv("POSTGRES_DATABASE"),
-    user=os.getenv("POSTGRES_USER"),
-    password=os.getenv("POSTGRES_PASSWORD"),
+    user=os.getenv("POSTGRES_ADMIN_USER"),
+    password=os.getenv("POSTGRES_ADMIN_PASSWORD"),
 )
 
 cursor = conn.cursor()
 
-cursor.execute("""
-    SELECT *
-    FROM onboarding_events
-    
-""")
+cursor.execute("DROP TABLE IF EXISTS onboarding_events")
 
-rows = cursor.fetchall()
+conn.commit()
 
-for row in rows:
-    print(row)
+print("onboarding_events table dropped successfully.")
 
 cursor.close()
 conn.close()
