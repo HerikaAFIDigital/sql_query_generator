@@ -1,0 +1,3 @@
+﻿id;profile_id;event_type;description;screen_name;event_timestamp;is_local_user;language_id;autonym_script;extra;source_file;ingested_at
+6c8eb129-deaa-4a3b-b6b7-2be5fb319385;BWT-ZQP-UCW-SRJ-U1;viewed;User viewed onboarding screen;onboarding_screen;1789979227410;;7b5c6d2548de4ec7a84335c592c2d05b;Bangladesh - Bangla;;BWT-ZQP-UCW-SRJ-U1_69e74c2a-6509-4022-9630-4be607976d14;2026-09-21 12:00:09.189606+00
+"04517eab-10f6-4b7e-8016-20dfbf09c919";BWT-ZQP-UCW-SRJ-U1;viewed;"User viewed ""Why we need your data"" modal";onboarding_screen;1789979366899;;7b5c6d2548de4ec7a84335c592c2d05b;Bangladesh - Bangla;;BWT-ZQP-UCW-SRJ-U1_69e74c2a-6509-4022-9630-4be607976d14;2026-09-21 12:00:09.189608+00

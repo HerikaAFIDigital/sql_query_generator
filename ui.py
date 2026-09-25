@@ -1086,7 +1086,7 @@ PG_KWARGS = dict(
     password=os.getenv("POSTGRES_PASSWORD"),
 )
 
-KNOWN_TABLES = ["onboarding_events"]
+KNOWN_TABLES = ["onboarding_events", "app_lifecycle_events", "download_category_events", "download_language_events", "interaction_events", "terms_conditions_events"]
 
 TEXT_TYPES = ("text", "character varying", "varchar", "char", "character")
 
@@ -1193,7 +1193,23 @@ _init_cache_db()
 
 class SchemaEnhancer(LlmContextEnhancer):
 
-    def __init__(self, pg_kwargs, tables, enum_threshold=50):
+    TABLE_DESCRIPTIONS = {
+        "onboarding_events": "one row per survey question a user (profile_id) answered during onboarding. question_id = full text of the question; answer_id = literal answer text.",
+        "app_lifecycle_events": "one row per app install/open event per user, with device model, OS, app version, and language info.",
+        "download_category_events": "one row per category-selection or download action on the content category screen. category_title = human-readable name of the category selected.",
+        "download_language_events": "one row per language-selection or download action. autonym_script = human-readable language name.",
+        "interaction_events": "general screen-view and UI-interaction events (e.g. viewing the onboarding screen or a modal).",
+        "terms_conditions_events": "terms & conditions acceptance events; is_accepted = '1' means accepted.",
+    }
+
+    # Columns whose values are large JSON arrays or UUIDs — skip enum dump for these
+    _SKIP_ENUM_COLUMNS = {
+        "selected_categories", "selected_category_titles", "extra",
+        "id", "session_id", "app_installation_id", "category_id",
+        "language_id", "source_file", "ingested_at", "event_timestamp",
+    }
+
+    def __init__(self, pg_kwargs, tables, enum_threshold=30):
         self.pg_kwargs = pg_kwargs
         self.tables = tables
         self.enum_threshold = enum_threshold
@@ -1226,7 +1242,7 @@ class SchemaEnhancer(LlmContextEnhancer):
                 col_parts = []
                 for name, dtype in cols:
                     part = f"{name} ({dtype})"
-                    if dtype in TEXT_TYPES:
+                    if dtype in TEXT_TYPES and name not in self._SKIP_ENUM_COLUMNS:
                         cur.execute(f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"')
                         row = cur.fetchone()
                         distinct_count = row[0] if row is not None else None
@@ -1253,48 +1269,180 @@ class SchemaEnhancer(LlmContextEnhancer):
 
     async def enhance_system_prompt(self, system_prompt, user_message, user):
         schema = self._load_schema()
+
+        table_descriptions = "\n".join(
+            f"- `{name}`: {desc}"
+            for name, desc in self.TABLE_DESCRIPTIONS.items()
+            if name in self.tables
+        )
+
         return (
             system_prompt
-            + "\n\n## Database schema (this is the ONLY schema that exists)\n"
+            + "\n\n## Database schema (these are the ONLY tables that exist)\n"
             + schema
-            + "\n\n## How this schema works\n"
-            + "- `onboarding_events` stores ONE ROW PER QUESTION a user (`profile_id`) answered.\n"
-            + "- `question_id` holds the FULL TEXT of the question (not a numeric id).\n"
-            + "- `answer_id` holds the literal answer text (not a numeric id).\n"
-            + "- Only use the exact question/answer strings listed above — never paraphrase or guess wording.\n"
-            + "\n## CRITICAL: how to write the query\n"
-            + "- If the question compares, breaks down, or asks about ALL values of something "
-              "(e.g. 'yes vs no', 'by profession', 'for each answer'), write ONE SINGLE query "
-              "using GROUP BY that returns every relevant category in one result set. "
-              "NEVER run separate queries per value.\n"
-            + "- WRONG (only returns one category, misses the rest):\n"
-              "  SELECT COUNT(DISTINCT profile_id) FROM onboarding_events\n"
-              "  WHERE question_id = 'Is this device a shared phone/tablet?' AND answer_id = 'yes';\n"
-            + "- RIGHT (returns every category in one query):\n"
-              "  SELECT answer_id, COUNT(DISTINCT profile_id) AS count\n"
-              "  FROM onboarding_events\n"
-              "  WHERE question_id = 'Is this device a shared phone/tablet?'\n"
-              "  GROUP BY answer_id;\n"
-            + "- Only filter to a single answer_id when the user explicitly asks about just ONE "
-              "specific answer, with no comparison or breakdown implied.\n"
-            + "- For a breakdown across TWO different questions (e.g. 'shared device by profession'), "
-              "self-join the table on profile_id, once per question involved. Example:\n"
-              "  SELECT p.answer_id AS profession, d.answer_id AS shared_device,\n"
-              "         COUNT(DISTINCT p.profile_id) AS count\n"
-              "  FROM onboarding_events p\n"
-              "  JOIN onboarding_events d ON p.profile_id = d.profile_id\n"
-              "  WHERE p.question_id = 'What is your profession?'\n"
-              "    AND d.question_id = 'Is this device a shared phone/tablet?'\n"
-              "  GROUP BY p.answer_id, d.answer_id;\n"
-            + "- Run exactly ONE run_sql call per question, unless the first query returns an error "
-              "and you need to correct it.\n"
-            + "- You MUST execute the SQL using the run_sql tool for EVERY question so full data "
-              "rows and charts are generated. Never answer without running run_sql.\n"
+            + "\n\n## What each table represents\n"
+            + table_descriptions
+            + "\n\n## Critical schema notes\n"
+
+            # --- onboarding_events ---
+            + "### onboarding_events\n"
+            + "- profile_id is a text code like 'BWT-WIF-ABW-LAY-U1' (NOT an integer).\n"
+            + "- question_id holds the FULL TEXT of the survey question (not a numeric id).\n"
+            + "- answer_id holds the literal answer text (not a numeric id), e.g. 'yes', 'no', 'doctor'.\n"
+            + "- event_time (timestamp) is the correct column for time-based filtering — NOT event_timestamp (which is a Unix-ms text string).\n"
+            + "- ONE ROW = ONE question answered by one user. To count distinct users, always use COUNT(DISTINCT profile_id).\n"
+            + "- Only use the exact question/answer strings shown in the schema above — never paraphrase.\n"
+
+            # --- app_lifecycle_events ---
+            + "\n### app_lifecycle_events\n"
+            + "- event_type is always 'installed' in the current data.\n"
+            + "- device_model, device_os, app_version, autonym_script contain device/app metadata.\n"
+            + "- event_time is the correct timestamp column for time filtering.\n"
+            + "- profile_id is a text code (same format as other tables).\n"
+
+            # --- download_category_events ---
+            + "\n### download_category_events\n"
+            + "- event_type values: 'selected' (user toggled a category), 'downloaded' (user pressed download).\n"
+            + "- status values: 'selected', 'completed'.\n"
+            + "- category_title = human-readable category name (e.g. 'Infection prevention', 'Newborn health').\n"
+            + "- To find which categories were downloaded, filter event_type = 'downloaded' and parse selected_category_titles, OR join on category_title where event_type = 'selected'.\n"
+            + "- autonym_script = language name (e.g. 'Ethiopia - English', 'English').\n"
+            + "- event_time is the correct timestamp column.\n"
+
+            # --- download_language_events ---
+            + "\n### download_language_events\n"
+            + "- event_type values: 'selected', 'downloaded', 'cancelled'.\n"
+            + "- status values: 'selected', 'completed', 'cancelled'.\n"
+            + "- autonym_script = human-readable language name (e.g. 'Ethiopia - English', 'Bangladesh - Bangla').\n"
+            + "- is_selective_download = '1' means download-without-videos was chosen.\n"
+            + "- event_time is the correct timestamp column.\n"
+
+            # --- interaction_events ---
+            + "\n### interaction_events\n"
+            + "- Tracks screen views and modal views during onboarding.\n"
+            + "- event_type = 'viewed'; screen_name = 'onboarding_screen'.\n"
+            + "- autonym_script = language in use during the interaction.\n"
+
+            # --- terms_conditions_events ---
+            + "\n### terms_conditions_events\n"
+            + "- event_type = 'accepted' means user accepted terms & conditions.\n"
+            + "- is_accepted = '1' for accepted events.\n"
+            + "- autonym_script = language name during acceptance.\n"
+
+            # --- cross-table joins ---
+            + "\n## Joining tables\n"
+            + "- Every table uses profile_id (text) as the shared user identifier.\n"
+            + "- To correlate events across tables, JOIN ON profile_id. Example:\n"
+            + "  SELECT COUNT(DISTINCT a.profile_id)\n"
+            + "  FROM app_lifecycle_events a\n"
+            + "  JOIN terms_conditions_events t ON a.profile_id = t.profile_id\n"
+            + "  WHERE a.event_type = 'installed';\n"
+
+            # --- query rules ---
+            + "\n## Rules for writing queries\n"
+            + "- Always use COUNT(DISTINCT profile_id) when counting users.\n"
+            + "- For breakdowns ('by profession', 'yes vs no', 'per language'), use a single query with GROUP BY — NEVER multiple queries per value.\n"
+            + "- Example of a breakdown:\n"
+            + "  SELECT answer_id, COUNT(DISTINCT profile_id) AS users\n"
+            + "  FROM onboarding_events\n"
+            + "  WHERE question_id = 'Is this device a shared phone/tablet?'\n"
+            + "  GROUP BY answer_id;\n"
+            + "- For cross-question breakdowns within onboarding_events, self-join on profile_id:\n"
+            + "  SELECT p.answer_id AS profession, d.answer_id AS shared_device, COUNT(DISTINCT p.profile_id) AS users\n"
+            + "  FROM onboarding_events p\n"
+            + "  JOIN onboarding_events d ON p.profile_id = d.profile_id\n"
+            + "  WHERE p.question_id = 'What is your profession?'\n"
+            + "    AND d.question_id = 'Is this device a shared phone/tablet?'\n"
+            + "  GROUP BY p.answer_id, d.answer_id;\n"
+            + "- Run exactly ONE run_sql call per user question (retry only on SQL error).\n"
+            + "- You MUST execute the SQL using the run_sql tool for EVERY question. Never answer without running run_sql.\n"
+            + "- NEVER use placeholder text like '[X]', '[value]', '[X seconds]', '[calculated]' in your answer. "
+              "Always embed the EXACT numeric or text value returned by the SQL query into your response.\n"
+            + "- After running run_sql and getting results, your answer MUST include the real numbers from those results. "
+              "Example: say '8 minutes and 9 seconds (489 seconds)' NOT 'X minutes'.\n"
+            + "- If the question asks for a duration, always present it in human-readable form: "
+              "e.g. '8 min 9 sec' or '2 hours 5 min'. Never leave the unit as a raw epoch number without explanation.\n"
+
+            # --- analytical reasoning ---
+            + "\n## Analytical reasoning — deriving metrics from available data\n"
+            + "NEVER refuse to answer a question just because an exact column for the metric does not exist.\n"
+            + "These are real production event logs. Every event has an event_time timestamp. Use that to derive any time-based metric.\n"
+
+            + "\n### Derived metric: time spent on app / session duration\n"
+            + "There is no explicit 'duration' column, but you CAN derive it:\n"
+            + "- A user's onboarding session spans from their FIRST event_time to their LAST event_time across ALL tables.\n"
+            + "- Use a UNION ALL of all six tables to get every event_time for a user, then compute MAX - MIN.\n"
+            + "- Example — user who spent the most time on app:\n"
+            + "  WITH all_events AS (\n"
+            + "    SELECT profile_id, event_time FROM onboarding_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM app_lifecycle_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM download_category_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM download_language_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM interaction_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM terms_conditions_events\n"
+            + "  )\n"
+            + "  SELECT profile_id,\n"
+            + "         MIN(event_time) AS session_start,\n"
+            + "         MAX(event_time) AS session_end,\n"
+            + "         ROUND(EXTRACT(EPOCH FROM (MAX(event_time) - MIN(event_time)))) AS duration_seconds,\n"
+            + "         ROUND(EXTRACT(EPOCH FROM (MAX(event_time) - MIN(event_time))) / 60.0, 2) AS duration_minutes,\n"
+            + "         COUNT(*) AS total_events\n"
+            + "  FROM all_events\n"
+            + "  GROUP BY profile_id\n"
+            + "  ORDER BY duration_seconds DESC\n"
+            + "  LIMIT 1;\n"
+            + "- The result will contain duration_seconds and duration_minutes. Use BOTH in your answer for clarity.\n"
+
+            + "\n### Derived metric: number of steps / engagement depth\n"
+            + "- Count total events (across all tables) per user to measure how many onboarding steps they went through.\n"
+            + "- More events = more engaged / deeper into the onboarding funnel.\n"
+
+            + "\n### Derived metric: onboarding funnel / completion\n"
+            + "- A user who has rows in app_lifecycle_events AND terms_conditions_events AND onboarding_events has completed more steps.\n"
+            + "- Use EXISTS or JOIN patterns across tables to identify which stage each user reached.\n"
+
+            + "\n### Derived metric: most popular / least popular categories or languages\n"
+            + "- For downloads: filter download_category_events WHERE event_type = 'downloaded', group by category_title or autonym_script.\n"
+            + "- For language preferences: group download_language_events by autonym_script WHERE event_type = 'downloaded'.\n"
+
+            + "\n### Derived metric: filtering by app version\n"
+            + "- app_version is only in app_lifecycle_events. To filter other tables by app version, JOIN them to app_lifecycle_events ON profile_id.\n"
+            + "- Example — users with version 4.0.0 who spent the most time on the app:\n"
+            + "  WITH versioned_users AS (\n"
+            + "    SELECT DISTINCT profile_id FROM app_lifecycle_events WHERE app_version = '4.0.0'\n"
+            + "  ),\n"
+            + "  all_events AS (\n"
+            + "    SELECT profile_id, event_time FROM onboarding_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM app_lifecycle_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM download_category_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM download_language_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM interaction_events\n"
+            + "    UNION ALL SELECT profile_id, event_time FROM terms_conditions_events\n"
+            + "  )\n"
+            + "  SELECT ae.profile_id,\n"
+            + "         ROUND(EXTRACT(EPOCH FROM (MAX(ae.event_time) - MIN(ae.event_time)))) AS duration_seconds,\n"
+            + "         ROUND(EXTRACT(EPOCH FROM (MAX(ae.event_time) - MIN(ae.event_time))) / 60.0, 2) AS duration_minutes,\n"
+            + "         COUNT(*) AS total_events\n"
+            + "  FROM all_events ae\n"
+            + "  INNER JOIN versioned_users vu ON ae.profile_id = vu.profile_id\n"
+            + "  GROUP BY ae.profile_id\n"
+            + "  ORDER BY duration_seconds DESC\n"
+            + "  LIMIT 1;\n"
+
+            + "\n### General principle\n"
+            + "- Before saying a metric cannot be computed, ask yourself: can I approximate it using event_time, COUNT(*), or by joining tables on profile_id?\n"
+            + "- If yes — write the SQL and return real numbers. NEVER return a refusal when data-driven approximation is possible.\n"
+            + "- Only say 'cannot be computed' if the required raw data is genuinely absent from ALL tables (e.g. GPS coordinates when none of the tables have lat/long values).\n"
+            + "- Always label derived columns clearly (e.g. 'duration_seconds', 'duration_minutes') so the user knows it is inferred.\n"
+            + "- CRITICAL: After running SQL, read the actual result row and embed the EXACT values into your answer. "
+              "NEVER write placeholder text like '[X]', '[value]', '[calculated]', '[X seconds]', or 'X minutes'. "
+              "If the query returned 489 seconds, your answer MUST say '489 seconds (approx. 8 minutes 9 seconds)'.\n"
+            + "- Do NOT ask the user if they want the result in different units BEFORE giving the answer. "
+              "Give the result first in both seconds AND minutes/hours. Follow-up questions are fine after.\n"
         )
 
     async def enhance_user_messages(self, messages, user):
         return messages
-
 
 # ============================================================
 # 6. USER RESOLVER
