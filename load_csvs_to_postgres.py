@@ -128,26 +128,29 @@ def create_unified_view(engine, created_tables: list):
         print("  Created unified view 'v_all_events' across all event tables.")
 
 
-def main():
+def ingest_csv_directory(csv_folder: str = CSV_FOLDER, engine=None) -> dict:
+    """Ingests all CSVs in csv_folder into PostgreSQL with indexing and permissions."""
     if not PG_ADMIN_USER or not PG_ADMIN_PASSWORD:
-        sys.exit(
+        raise ValueError(
             "Set POSTGRES_ADMIN_USER and POSTGRES_ADMIN_PASSWORD in .env "
             "to a role that can CREATE TABLE — vanna_readonly can't write."
         )
 
-    engine = create_engine(
-        f"postgresql+psycopg2://{PG_ADMIN_USER}:{PG_ADMIN_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
-    )
+    if engine is None:
+        engine = create_engine(
+            f"postgresql+psycopg2://{PG_ADMIN_USER}:{PG_ADMIN_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
+        )
 
-    csv_files = sorted(Path(CSV_FOLDER).glob("*.csv"))
+    csv_files = sorted(Path(csv_folder).glob("*.csv"))
     if not csv_files:
-        sys.exit(f"No CSV files found in {CSV_FOLDER}")
+        return {"status": "error", "message": f"No CSV files found in {csv_folder}", "tables": []}
 
     groups = defaultdict(list)
     for csv_path in csv_files:
         groups[group_key(sanitize_name(csv_path.stem))].append(csv_path)
 
     created_tables = []
+    row_counts = {}
 
     for table_name, parts in groups.items():
         print(f"Loading {[p.name for p in parts]} -> table '{table_name}' ...")
@@ -156,6 +159,7 @@ def main():
 
         combined.to_sql(table_name, engine, if_exists="replace", index=False, chunksize=25000)
         created_tables.append(table_name)
+        row_counts[table_name] = len(combined)
         print(f"  Loaded {len(combined):,} rows.")
 
         create_indexes_for_table(engine, table_name, list(combined.columns))
@@ -167,7 +171,22 @@ def main():
 
     create_unified_view(engine, created_tables)
 
-    print("\nDatabase is ready for high-scale queries.")
+    return {
+        "status": "ok",
+        "tables": created_tables,
+        "row_counts": row_counts,
+        "total_rows": sum(row_counts.values()),
+        "files_processed": len(csv_files),
+    }
+
+
+def main():
+    res = ingest_csv_directory()
+    if res["status"] == "ok":
+        print(f"\nSuccessfully loaded {res['files_processed']} CSV files into {len(res['tables'])} tables ({res['total_rows']:,} rows).")
+        print("Database is ready for high-scale queries.")
+    else:
+        print(res.get("message"))
 
 
 if __name__ == "__main__":

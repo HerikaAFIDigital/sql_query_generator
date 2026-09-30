@@ -78,6 +78,81 @@ agent_memory = DemoAgentMemory()
 # --------------------------------------------------
 # 5. Dynamic Schema Enhancer
 # --------------------------------------------------
+TABLE_NOTES = """
+## CRITICAL ARCHITECTURE & RELATIONSHIP RULES:
+1. `profile_id` is the shared user identifier across ALL tables (app_lifecycle_events, download_language_events, download_category_events, onboarding_events, terms_conditions_events, interaction_events, v_all_events).
+2. Joining multiple tables:
+   - When a question requires filtering or aggregating across multiple tables (e.g. users on Android who downloaded a category), JOIN the tables on "profile_id".
+   - Example: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a JOIN "download_category_events" c ON a."profile_id" = c."profile_id" WHERE a."device_os" = 'Android' AND c."event_type" = 'downloaded';
+3. `event_time` (timestamp) is the primary time column for date filtering. For daily breakdowns or filtering by day, use: DATE("event_time") = 'YYYY-MM-DD' or "event_time"::date = 'YYYY-MM-DD'.
+4. Always use `COUNT(DISTINCT "profile_id")` when counting users.
+5. Do NOT use LIMIT unless specifically asked.
+6. Always qualify table names with double-quotes e.g. "download_category_events".
+
+## SCREEN & EVENT LOGGING RULES (MANDATORY):
+- **Category Screen (`category_list_screen`)**:
+  - Logged in table `"download_category_events"` (and in `"v_all_events"` where `screen_name = 'category_list_screen'`).
+  - Its event_type values are ONLY 'selected' and 'downloaded'.
+  - IMPORTANT: There is NO 'viewed' event_type for category screen! When the user asks "how many users viewed / visited / reached / opened category screen", query:
+    SELECT COUNT(DISTINCT "profile_id") FROM "download_category_events";
+    (or SELECT COUNT(DISTINCT "profile_id") FROM "v_all_events" WHERE "screen_name" = 'category_list_screen';).
+    NEVER add `AND event_type = 'viewed'`.
+
+- **Language Screen (`language_list_screen`)**:
+  - Logged in table `"download_language_events"` (and in `"v_all_events"` where `screen_name = 'language_list_screen'`).
+  - Its event_type values are 'selected', 'downloaded', 'cancelled'.
+  - IMPORTANT: There is NO 'viewed' event_type for language screen! When the user asks "how many users viewed / visited / reached language screen", query:
+    SELECT COUNT(DISTINCT "profile_id") FROM "download_language_events" WHERE "screen_name" = 'language_list_screen';
+    NEVER add `AND event_type = 'viewed'`.
+
+- **App Install / Launch (`splash_screen`)**:
+  - Logged in table `"app_lifecycle_events"`.
+  - Contains device_model, device_os, app_version, app_id, location_lat, location_long, language_version.
+  - Event type: 'installed'.
+
+- **Terms & Conditions (`onboarding_screen`)**:
+  - Logged in table `"terms_conditions_events"`.
+  - Event type: 'accepted', `is_accepted = '1'`.
+
+- **Onboarding Survey (`onboarding_survey_screen`)**:
+  - Logged in table `"onboarding_events"`.
+  - Event type: 'answered'.
+  - `question_id` contains the English question string (e.g. 'Is this device a shared phone/tablet?', 'Are you a healthcare professional (or studying to become one)?', 'Where do you work?', 'What is your profession?', 'How did you hear about the Safe Delivery app?', 'How many years of experience do you have as a healthcare professional?').
+  - `answer_id` contains normalized answer code ('yes', 'no', 'student', 'other', '6_to_10_years', etc.).
+  - Always use `"question_id" ILIKE '%keyword%'` and `"answer_id" = '...'`.
+
+- **Interaction Events**:
+  - Table `"interaction_events"` only logs modal popups (like "Why we need your data" modal) on onboarding carousel.
+  - Do NOT use `"interaction_events"` for category screen or language screen.
+
+- **Unified Cross-Table View (`v_all_events`)**:
+  - Unified view combining all event tables with columns: `profile_id`, `event_time`, `event_timestamp`, `event_type`, `description`, `screen_name`, `log_source`, `session_id`, `autonym_script`.
+  - Ideal for cross-screen sequences, funnels, and user timelines.
+
+- **Drop-offs & Funnels**:
+  - To find users who did action A but not action B, use `WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM ...)` or compare stage counts.
+
+FEW-SHOT EXAMPLES:
+User: How many users viewed category screen
+SQL: SELECT COUNT(DISTINCT "profile_id") FROM "download_category_events";
+
+User: How many users viewed language screen
+SQL: SELECT COUNT(DISTINCT "profile_id") FROM "download_language_events" WHERE "screen_name" = 'language_list_screen';
+
+User: How many users on Android downloaded a category?
+SQL: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a JOIN "download_category_events" c ON a."profile_id" = c."profile_id" WHERE a."device_os" = 'Android' AND c."event_type" = 'downloaded';
+
+User: How many users answered yes to the shared phone question?
+SQL: SELECT COUNT(DISTINCT "profile_id") FROM "onboarding_events" WHERE "question_id" ILIKE '%shared phone%' AND "answer_id" = 'yes';
+
+User: How many users accepted terms and conditions?
+SQL: SELECT COUNT(DISTINCT "profile_id") FROM "terms_conditions_events" WHERE "event_type" = 'accepted';
+
+User: How many users installed the app but dropped off before category screen?
+SQL: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a WHERE a."profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_category_events");
+"""
+
+
 class DynamicSchemaEnhancer(LlmContextEnhancer):
     """Pulls real column names/types from Postgres dynamically across all production tables."""
 
@@ -158,13 +233,8 @@ class DynamicSchemaEnhancer(LlmContextEnhancer):
             system_prompt
             + "\n\n## Database schema (PostgreSQL production data)\n"
             + schema
-            + "\n\n## Important Guidelines\n"
-            + "- `profile_id` is the shared user identifier across all event tables.\n"
-            + "- `event_time` (timestamp) is the primary time column for date filtering.\n"
-            + "- Always use `COUNT(DISTINCT profile_id)` when counting users.\n"
-            + "- Use `v_all_events` when querying across all event tables.\n"
-            + "- In `onboarding_events`, `question_id` has the full text of the question, and `answer_id` is the literal answer.\n"
-            + "- Always execute SQL via `run_sql` and cite real numbers from the output.\n"
+            + "\n\n"
+            + TABLE_NOTES
         )
 
     async def enhance_user_messages(self, messages, user):

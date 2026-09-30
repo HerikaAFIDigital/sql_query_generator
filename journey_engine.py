@@ -2,6 +2,8 @@ import os
 import json
 import re
 import datetime
+import urllib.request
+import urllib.error
 from collections import defaultdict
 import psycopg2
 import pandas as pd
@@ -93,6 +95,9 @@ def format_human_duration(sec):
 
 
 class UserJourneyEngine:
+    # In-memory cache: (pattern_key) -> {"finding": ..., "fix": ...}
+    _issue_ai_cache: dict = {}
+
     def __init__(self, pg_kwargs=None):
         self.pg_kwargs = pg_kwargs or dict(
             host=os.getenv("POSTGRES_HOST", "localhost"),
@@ -101,6 +106,81 @@ class UserJourneyEngine:
             user=os.getenv("POSTGRES_USER", "vanna_readonly"),
             password=os.getenv("POSTGRES_PASSWORD"),
         )
+
+    # ------------------------------------------------------------------
+    # AI-powered dynamic issue analysis via Qwen (Ollama)
+    # ------------------------------------------------------------------
+    def _ai_enhance_issue(self, area: str, facts: dict, fallback_finding: str, fallback_fix: str) -> dict:
+        """Call Qwen via Ollama /api/chat to generate a concise finding + fix recommendation
+        for a detected issue pattern. Falls back to static text if Ollama is
+        unavailable or times out.
+
+        Uses /api/chat (not /api/generate) with think=False because qwen3 models
+        run in thinking mode by default and return an empty 'response' field
+        via /api/generate.
+        """
+        # Build a stable cache key from area + sorted facts
+        cache_key = area + "|" + json.dumps(facts, sort_keys=True)
+        if cache_key in UserJourneyEngine._issue_ai_cache:
+            return UserJourneyEngine._issue_ai_cache[cache_key]
+
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        model = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
+        facts_str = "\n".join(f"  - {k}: {v}" for k, v in facts.items())
+        user_msg = (
+            f"Issue: {area}\n"
+            f"Facts:\n{facts_str}\n\n"
+            f"Write exactly two lines (no markdown, no extra text):\n"
+            f"FINDING: <one sentence, max 25 words, describing what is happening>\n"
+            f"FIX: <one sentence, max 25 words, actionable recommendation for the dev team>"
+        )
+
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a mobile-app analytics expert for Maternity Foundation's "
+                        "'Safe Delivery' onboarding app. Always respond in the exact two-line "
+                        "format: FINDING: ... then FIX: ... with no additional text."
+                    ),
+                },
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "think": False,  # Disable thinking mode — required for qwen3 models
+            "options": {"temperature": 0.3, "num_predict": 100},
+        }).encode()
+
+        try:
+            req = urllib.request.Request(
+                f"{ollama_host}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode())
+            raw = body.get("message", {}).get("content", "").strip()
+
+            finding = fallback_finding
+            fix = fallback_fix
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped.upper().startswith("FINDING:"):
+                    finding = stripped[len("FINDING:"):].strip()
+                elif stripped.upper().startswith("FIX:"):
+                    fix = stripped[len("FIX:"):].strip()
+
+            result = {"finding": finding, "fix": fix}
+        except Exception:
+            # Ollama unavailable, slow, or error — fall back to static text gracefully
+            result = {"finding": fallback_finding, "fix": fallback_fix}
+
+        UserJourneyEngine._issue_ai_cache[cache_key] = result
+        return result
 
     def _get_connection(self):
         return psycopg2.connect(**self.pg_kwargs)
@@ -689,64 +769,141 @@ class UserJourneyEngine:
 
     def _detect_issues(self, users):
         issues = []
+        total_users = max(len(users), 1)  # avoid division by zero
+
         # P0: Onboarding asset download stall
         stuck_asset_users = [u["pid"] for u in users if u["bp"] == "Onboarding assets"]
         if stuck_asset_users:
+            pct = round(len(stuck_asset_users) / total_users * 100, 1)
+            ai = self._ai_enhance_issue(
+                area="Onboarding asset download stall",
+                facts={
+                    "users_stalled": len(stuck_asset_users),
+                    "total_users_in_cohort": total_users,
+                    "percent_affected": f"{pct}%",
+                    "stall_point": "Preparing language assets screen",
+                    "outcome": "never reached Terms & Conditions",
+                },
+                fallback_finding="The category asset download blocks onboarding until it finishes. Several users never got past it.",
+                fallback_fix="Let users reach Home while the download continues in the background, and show a clear progress bar.",
+            )
             issues.append({
                 "sev": "P0",
                 "area": "Onboarding asset download",
-                "finding": "The category asset download blocks onboarding until it finishes. Several users never got past it.",
-                "evidence": f"{len(stuck_asset_users)} user(s) stalled on 'Preparing language assets' and never reached T&C.",
+                "finding": ai["finding"],
+                "evidence": f"{len(stuck_asset_users)} user(s) ({pct}%) stalled on 'Preparing language assets' and never reached T&C.",
                 "users": stuck_asset_users,
-                "fix": "Let users reach Home while the download continues in the background, and show a clear progress bar.",
+                "fix": ai["fix"],
             })
 
         # P0: Language download cancellation loops
         lang_cancel_users = [u["pid"] for u in users if u["bp"] == "Language screen" and u["counts"]["lcan"] >= 10]
         if lang_cancel_users:
+            pct = round(len(lang_cancel_users) / total_users * 100, 1)
+            avg_cancels = round(
+                sum(u["counts"]["lcan"] for u in users if u["pid"] in lang_cancel_users)
+                / max(len(lang_cancel_users), 1), 1
+            )
+            ai = self._ai_enhance_issue(
+                area="Language download cancellation loop",
+                facts={
+                    "users_affected": len(lang_cancel_users),
+                    "total_users_in_cohort": total_users,
+                    "percent_affected": f"{pct}%",
+                    "avg_cancellations_per_user": avg_cancels,
+                    "threshold_used": "10+ rapid picks & cancels",
+                    "outcome": "user never left the language screen",
+                },
+                fallback_finding="Language selection has high cancellation bursts within seconds of tapping.",
+                fallback_fix="Check download prompt button behavior and network timeout thresholds.",
+            )
             issues.append({
                 "sev": "P0",
                 "area": "Language download loop",
-                "finding": "Language selection has high cancellation bursts within seconds of tapping.",
-                "evidence": f"{len(lang_cancel_users)} user(s) had 10+ rapid language picks & cancels and never left the screen.",
+                "finding": ai["finding"],
+                "evidence": f"{len(lang_cancel_users)} user(s) ({pct}%) had {avg_cancels}+ avg language picks & cancels and never left the screen.",
                 "users": lang_cancel_users,
-                "fix": "Check download prompt button behavior and network timeout thresholds.",
+                "fix": ai["fix"],
             })
 
         # P1: Category screen drop-off
         cat_drop_users = [u["pid"] for u in users if u["bp"] == "Category screen"]
         if cat_drop_users:
+            pct = round(len(cat_drop_users) / total_users * 100, 1)
+            avg_toggles = round(
+                sum(u["counts"].get("ccat", 0) for u in users if u["pid"] in cat_drop_users)
+                / max(len(cat_drop_users), 1), 1
+            )
+            ai = self._ai_enhance_issue(
+                area="Category screen drop-off without downloading",
+                facts={
+                    "users_dropped": len(cat_drop_users),
+                    "total_users_in_cohort": total_users,
+                    "percent_dropped": f"{pct}%",
+                    "avg_category_toggles_per_user": avg_toggles,
+                    "outcome": "left without pressing the Download button",
+                },
+                fallback_finding="Users toggle categories multiple times but leave without starting the download.",
+                fallback_fix="Make the primary 'Download' CTA visually persistent and show total download size dynamically.",
+            )
             issues.append({
                 "sev": "P1",
                 "area": "Category screen",
-                "finding": "Users toggle categories multiple times but leave without starting the download.",
-                "evidence": f"{len(cat_drop_users)} user(s) toggled selections but did not press Download.",
+                "finding": ai["finding"],
+                "evidence": f"{len(cat_drop_users)} user(s) ({pct}%) made avg {avg_toggles} category toggles but did not press Download.",
                 "users": cat_drop_users,
-                "fix": "Make the primary 'Download' CTA visually persistent and show total download size dynamically.",
+                "fix": ai["fix"],
             })
 
         # P1: Duplicate T&C accepts
         dup_tc_users = [u["pid"] for u in users if u["counts"]["tc"] > 1]
         if dup_tc_users:
+            pct = round(len(dup_tc_users) / total_users * 100, 1)
+            max_dups = max((u["counts"]["tc"] for u in users if u["pid"] in dup_tc_users), default=2)
+            ai = self._ai_enhance_issue(
+                area="Duplicate Terms & Conditions accepted events",
+                facts={
+                    "users_with_duplicates": len(dup_tc_users),
+                    "total_users_in_cohort": total_users,
+                    "percent_affected": f"{pct}%",
+                    "max_duplicate_count_observed": max_dups,
+                    "issue": "T&C accepted event fires more than once per user on the same onboarding slide",
+                },
+                fallback_finding="The onboarding T&C 'accepted' event fires repeatedly on the same slide.",
+                fallback_fix="Disable or debounce the accept button once tapped and log T&C accept once per user.",
+            )
             issues.append({
                 "sev": "P1",
                 "area": "T&C acceptance",
-                "finding": "The onboarding T&C 'accepted' event fires repeatedly on the same slide.",
-                "evidence": f"{len(dup_tc_users)} user(s) fired duplicate T&C accepted events (e.g. 2× to 8×).",
+                "finding": ai["finding"],
+                "evidence": f"{len(dup_tc_users)} user(s) ({pct}%) fired duplicate T&C accepted events (max {max_dups}×).",
                 "users": dup_tc_users,
-                "fix": "Disable or debounce the accept button once tapped and log T&C accept once per user.",
+                "fix": ai["fix"],
             })
 
         # Info: Emulator / Test traffic
         emu_users = [u["pid"] for u in users if u["emu"]]
         if emu_users:
+            pct = round(len(emu_users) / total_users * 100, 1)
+            ai = self._ai_enhance_issue(
+                area="Emulator and test device traffic in production cohort",
+                facts={
+                    "emulator_profiles": len(emu_users),
+                    "total_users_in_cohort": total_users,
+                    "percent_of_cohort": f"{pct}%",
+                    "device_models": "sdk_goog3 or sdk_gphone (Android SDK emulators)",
+                    "risk": "skews conversion metrics and funnel drop-off rates",
+                },
+                fallback_finding="Several profiles are on Android SDK emulators representing internal QA runs.",
+                fallback_fix="Tag and filter emulator sessions so production cohort conversion is not skewed.",
+            )
             issues.append({
                 "sev": "Info",
                 "area": "Test devices",
-                "finding": "Several profiles are on Android SDK emulators representing internal QA runs.",
-                "evidence": f"{len(emu_users)} profile(s) running on sdk_goog3 or sdk_gphone.",
+                "finding": ai["finding"],
+                "evidence": f"{len(emu_users)} profile(s) ({pct}%) running on sdk_goog3 or sdk_gphone.",
                 "users": emu_users,
-                "fix": "Tag and filter emulator sessions so production cohort conversion is not skewed.",
+                "fix": ai["fix"],
             })
 
         return issues
@@ -803,43 +960,43 @@ class UserJourneyEngine:
 
     def render_html_report(self, rep: dict) -> str:
         data_json = json.dumps(rep, default=str)
-        html = f"""<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}}html{{scroll-padding-top:env(safe-area-inset-top,0px)}}body{{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}}img{{max-width:100%}}[hidden]:not([hidden=until-found i]){{display:none!important}}</style></head><body>
-<title>Safe Delivery Onboarding Flows</title>
+        html = f"""<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}}html{{scroll-padding-top:env(safe-area-inset-top,0px)}}body{{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#FAFAFA;color:#1D1D1B}}img{{max-width:100%}}[hidden]:not([hidden=until-found i]){{display:none!important}}</style></head><body>
+<title>Maternity Foundation · Safe Delivery Onboarding Flows</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
 :root{{
-  --ground:#F4F6F8; --surface:#FFFFFF; --sunk:#EEF1F4; --ink:#16202A; --ink2:#3B4754; --muted:#667382; --line:#DCE2E8; --line2:#C9D1D9;
-  --accent:#0F6E86; --accent-soft:#E1F0F4;
-  --good:#23734A; --good-bg:#E3F3EA; --bad:#B42318; --bad-bg:#FCE8E6; --warn:#9A5B00; --warn-bg:#FDF1DC; --p2:#6B5B00; --p2-bg:#F6F0CF;
-  --s-splash:#8A96A3; --s-language:#D69A1E; --s-category:#3E9B63; --s-onboarding:#2F78C4; --s-survey:#7B5BC9;
-  --s-app:#C2477A; --s-app-bg:#FBE6EF; --s-splash-bg:#EDF0F3; --s-language-bg:#FBF1DC; --s-category-bg:#E4F3EA; --s-onboarding-bg:#E3EEFA; --s-survey-bg:#EEE8FA;
-  --shadow:0 1px 2px rgba(22,32,42,.06),0 4px 16px rgba(22,32,42,.05);
-  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+  --ground:#FAFAFA; --surface:#FFFFFF; --sunk:#F2F2F2; --ink:#1D1D1B; --ink2:#444444; --muted:#777777; --line:#E5E5E5; --line2:#D0D0D0;
+  --accent:#A80041; --accent-soft:#F9E6EE;
+  --good:#1B7D50; --good-bg:#EBF7F0; --bad:#A80041; --bad-bg:#FDF0F4; --warn:#C05621; --warn-bg:#FEF5ED; --p2:#7D0030; --p2-bg:#FCE7F3;
+  --s-splash:#777777; --s-language:#C05621; --s-category:#1B7D50; --s-onboarding:#7D0030; --s-survey:#A80041;
+  --s-app:#006699; --s-app-bg:#E6F4FA; --s-splash-bg:#F2F2F2; --s-language-bg:#FEF5ED; --s-category-bg:#EBF7F0; --s-onboarding-bg:#FCE7F3; --s-survey-bg:#F9E6EE;
+  --shadow:0 1px 3px rgba(0,0,0,.07),0 4px 14px rgba(0,0,0,.05);
+  --sans:"Montserrat",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --cond:"Montserrat",system-ui,-apple-system,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }}
 @media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{
   color-scheme:dark;
-  --ground:#0E1419; --surface:#151D24; --sunk:#1B252E; --ink:#E4EAF0; --ink2:#C3CDD7; --muted:#8F9CAA; --line:#26323D; --line2:#33414E;
-  --accent:#5DB6CE; --accent-soft:#16323B;
-  --good:#6CCB96; --good-bg:#15301F; --bad:#F2877C; --bad-bg:#3A1A17; --warn:#E9B25A; --warn-bg:#35270F; --p2:#D9C86A; --p2-bg:#2F2B12;
-  --s-splash:#8C98A5; --s-language:#E2AE45; --s-category:#5DBB83; --s-onboarding:#5F9EE0; --s-survey:#A38BE6;
-  --s-app:#E685AE; --s-app-bg:#3A1C2A; --s-splash-bg:#1E262E; --s-language-bg:#33280F; --s-category-bg:#15301F; --s-onboarding-bg:#152A40; --s-survey-bg:#261E3A;
-  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 16px rgba(0,0,0,.25);
+  --ground:#141414; --surface:#1E1E1E; --sunk:#282828; --ink:#F0F0F0; --ink2:#CCCCCC; --muted:#888888; --line:#333333; --line2:#444444;
+  --accent:#D9004B; --accent-soft:#3D0017;
+  --good:#34D399; --good-bg:#15301F; --bad:#F87171; --bad-bg:#3A1A17; --warn:#FBBF24; --warn-bg:#35270F; --p2:#F472B6; --p2-bg:#2A1A3E;
+  --s-splash:#888888; --s-language:#FBBF24; --s-category:#34D399; --s-onboarding:#F472B6; --s-survey:#D9004B;
+  --s-app:#38BDF8; --s-app-bg:#152A33; --s-splash-bg:#282828; --s-language-bg:#35270F; --s-category-bg:#15301F; --s-onboarding-bg:#2A1A3E; --s-survey-bg:#3D0017;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
 }}}}
 :root[data-theme="dark"]{{
   color-scheme:dark;
-  --ground:#0E1419; --surface:#151D24; --sunk:#1B252E; --ink:#E4EAF0; --ink2:#C3CDD7; --muted:#8F9CAA; --line:#26323D; --line2:#33414E;
-  --accent:#5DB6CE; --accent-soft:#16323B;
-  --good:#6CCB96; --good-bg:#15301F; --bad:#F2877C; --bad-bg:#3A1A17; --warn:#E9B25A; --warn-bg:#35270F; --p2:#D9C86A; --p2-bg:#2F2B12;
-  --s-splash:#8C98A5; --s-language:#E2AE45; --s-category:#5DBB83; --s-onboarding:#5F9EE0; --s-survey:#A38BE6;
-  --s-app:#E685AE; --s-app-bg:#3A1C2A; --s-splash-bg:#1E262E; --s-language-bg:#33280F; --s-category-bg:#15301F; --s-onboarding-bg:#152A40; --s-survey-bg:#261E3A;
-  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 16px rgba(0,0,0,.25);
+  --ground:#141414; --surface:#1E1E1E; --sunk:#282828; --ink:#F0F0F0; --ink2:#CCCCCC; --muted:#888888; --line:#333333; --line2:#444444;
+  --accent:#D9004B; --accent-soft:#3D0017;
+  --good:#34D399; --good-bg:#15301F; --bad:#F87171; --bad-bg:#3A1A17; --warn:#FBBF24; --warn-bg:#35270F; --p2:#F472B6; --p2-bg:#2A1A3E;
+  --s-splash:#888888; --s-language:#FBBF24; --s-category:#34D399; --s-onboarding:#F472B6; --s-survey:#D9004B;
+  --s-app:#38BDF8; --s-app-bg:#152A33; --s-splash-bg:#282828; --s-language-bg:#35270F; --s-category-bg:#15301F; --s-onboarding-bg:#2A1A3E; --s-survey-bg:#3D0017;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
 }}
 *{{box-sizing:border-box}}
-body{{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;margin:0}}
+body{{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;margin:0;-webkit-font-smoothing:antialiased}}
 .wrap{{max-width:1320px;margin:0 auto;padding-inline:20px;padding-block:0 48px}}
 button,input,select{{font:inherit;color:inherit}}
 a{{color:var(--accent)}}
@@ -848,15 +1005,15 @@ a{{color:var(--accent)}}
 .tnum{{font-variant-numeric:tabular-nums}}
 
 /* header */
-.top{{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:var(--ground);border-bottom:1px solid var(--line)}}
+.top{{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:#A80041;border-bottom:3px solid #7D0030;box-shadow:0 2px 10px rgba(0,0,0,.15)}}
 .top .wrap{{display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px;padding-block:12px}}
-.brand{{display:flex;flex-direction:column;gap:0;margin-right:auto}}
-.brand b{{font-family:var(--cond);font-size:20px;letter-spacing:-.01em;line-height:1.15}}
-.brand span{{color:var(--muted);font-size:12px}}
-.tabs{{display:flex;gap:4px;flex-wrap:wrap}}
-.tabs button{{border:1px solid transparent;background:none;padding:7px 14px;border-radius:999px;cursor:pointer;color:var(--ink2);font-weight:500}}
-.tabs button:hover{{background:var(--sunk)}}
-.tabs button[aria-selected="true"]{{background:var(--ink);color:var(--ground)}}
+.brand{{display:flex;flex-direction:column;gap:1px;margin-right:auto}}
+.brand b{{font-family:var(--cond);font-size:18px;font-weight:700;letter-spacing:-.01em;line-height:1.2;color:#ffffff}}
+.brand span{{color:rgba(255,255,255,.8);font-size:12px}}
+.tabs{{display:flex;gap:6px;flex-wrap:wrap}}
+.tabs button{{border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.12);padding:7px 16px;border-radius:4px;cursor:pointer;color:#ffffff;font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em;backdrop-filter:blur(4px);transition:all .15s ease}}
+.tabs button:hover{{background:rgba(255,255,255,.25);border-color:rgba(255,255,255,.6)}}
+.tabs button[aria-selected="true"]{{background:#ffffff;color:#A80041;border-color:#ffffff;font-weight:700}}
 
 h2{{font-family:var(--cond);font-size:17px;margin:0;letter-spacing:.005em;text-wrap:balance}}
 h3{{font-size:13px;margin:0;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600}}
@@ -1073,12 +1230,12 @@ tr.badrow td{{background:var(--warn-bg)}}
 </style>
 <header class="top">
   <div class="wrap">
-    <div class="brand"><b>Safe Delivery · Onboarding Flow Debugger</b><span id="meta"></span></div>
+    <div class="brand"><b>maternity FOUNDATION · Safe Delivery Flow Analysis</b><span id="meta"></span></div>
     <nav class="tabs" role="tablist" aria-label="Views">
       <button role="tab" id="t-overview" data-view="overview">Overview</button>
       <button role="tab" id="t-users" data-view="users">Users</button>
       <button role="tab" id="t-issues" data-view="issues">Issues</button>
-      <button role="tab" id="t-events" data-view="events">All events</button>
+      <button role="tab" id="t-events" data-view="events">All Events</button>
       <button role="tab" id="t-data" data-view="data">Data</button>
     </nav>
   </div>
