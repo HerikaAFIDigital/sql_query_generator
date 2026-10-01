@@ -87,52 +87,64 @@ TABLE_NOTES = """
 3. `event_time` (timestamp) is the primary time column for date filtering. For daily breakdowns or filtering by day, use: DATE("event_time") = 'YYYY-MM-DD' or "event_time"::date = 'YYYY-MM-DD'.
 4. Always use `COUNT(DISTINCT "profile_id")` when counting users.
 5. Do NOT use LIMIT unless specifically asked.
-6. Always qualify table names with double-quotes e.g. "download_category_events".
+6. Always qualify table names with double-quotes e.g. "download_category_events", "v_all_events".
+
+## DOMAIN MAPPING & VERB ROUTING REFERENCE (From Ingestion Service):
+- Machine-generated screen views (`User viewed...`, `User opened...`, `User navigated to...`) are logged in `"interaction_events"` with `screen_name`.
+- Domain actions (downloads, quiz answers, logins, questions) are logged in their domain tables.
+- **Unified Master View (`"v_all_events"`)**:
+  - The unified view combines ALL tables with: `profile_id`, `event_time`, `event_timestamp`, `event_type`, `description`, `screen_name`, `log_source`, `session_id`, `autonym_script`.
+  - ALWAYS use `"v_all_events"` for cross-screen comparisons, funnels, drop-offs, user retention, daily active users, or user journeys.
 
 ## SCREEN & EVENT LOGGING RULES (MANDATORY):
-- **Category Screen (`category_list_screen`)**:
-  - Logged in table `"download_category_events"` (and in `"v_all_events"` where `screen_name = 'category_list_screen'`).
-  - Its event_type values are ONLY 'selected' and 'downloaded'.
-  - IMPORTANT: There is NO 'viewed' event_type for category screen! When the user asks "how many users viewed / visited / reached / opened category screen", query:
-    SELECT COUNT(DISTINCT "profile_id") FROM "download_category_events";
-    (or SELECT COUNT(DISTINCT "profile_id") FROM "v_all_events" WHERE "screen_name" = 'category_list_screen';).
-    NEVER add `AND event_type = 'viewed'`.
-
+- **Screen Comparisons & Navigation (e.g. Language vs Category screens)**:
+  - When comparing users across screens (e.g. "how many users opened language screen vs category screen", "drop-off between screens"):
+    You MUST query the unified view `"v_all_events"` using `screen_name`:
+    ```sql
+    SELECT 
+      'Language Screen' AS "screen", 
+      COUNT(DISTINCT "profile_id") AS "user_count"
+    FROM "v_all_events"
+    WHERE "screen_name" ILIKE '%language_list%'
+    UNION ALL
+    SELECT 
+      'Category Screen' AS "screen", 
+      COUNT(DISTINCT "profile_id") AS "user_count"
+    FROM "v_all_events"
+    WHERE "screen_name" ILIKE '%category_list%'
+    ORDER BY "user_count" DESC;
+    ```
 - **Language Screen (`language_list_screen`)**:
   - Logged in table `"download_language_events"` (and in `"v_all_events"` where `screen_name = 'language_list_screen'`).
-  - Its event_type values are 'selected', 'downloaded', 'cancelled'.
-  - IMPORTANT: There is NO 'viewed' event_type for language screen! When the user asks "how many users viewed / visited / reached language screen", query:
-    SELECT COUNT(DISTINCT "profile_id") FROM "download_language_events" WHERE "screen_name" = 'language_list_screen';
-    NEVER add `AND event_type = 'viewed'`.
-
+  - Verbs / event_types: 'selected', 'downloaded', 'cancelled'.
+- **Category Screen (`category_list_screen`)**:
+  - Logged in table `"download_category_events"` (and in `"v_all_events"` where `screen_name = 'category_list_screen'`).
+  - Verbs / event_types: 'selected', 'downloaded', 'interacted', 'started'.
 - **App Install / Launch (`splash_screen`)**:
   - Logged in table `"app_lifecycle_events"`.
-  - Contains device_model, device_os, app_version, app_id, location_lat, location_long, language_version.
-  - Event type: 'installed'.
-
+  - Columns: `device_model`, `device_os`, `app_version`, `app_id`, `location_lat`, `location_long`, `language_version`.
+  - Event types: 'installed', 'started', 'app_launch'.
 - **Terms & Conditions (`onboarding_screen`)**:
   - Logged in table `"terms_conditions_events"`.
   - Event type: 'accepted', `is_accepted = '1'`.
-
 - **Onboarding Survey (`onboarding_survey_screen`)**:
   - Logged in table `"onboarding_events"`.
   - Event type: 'answered'.
-  - `question_id` contains the English question string (e.g. 'Is this device a shared phone/tablet?', 'Are you a healthcare professional (or studying to become one)?', 'Where do you work?', 'What is your profession?', 'How did you hear about the Safe Delivery app?', 'How many years of experience do you have as a healthcare professional?').
-  - `answer_id` contains normalized answer code ('yes', 'no', 'student', 'other', '6_to_10_years', etc.).
-  - Always use `"question_id" ILIKE '%keyword%'` and `"answer_id" = '...'`.
-
-- **Interaction Events**:
-  - Table `"interaction_events"` only logs modal popups (like "Why we need your data" modal) on onboarding carousel.
-  - Do NOT use `"interaction_events"` for category screen or language screen.
-
-- **Unified Cross-Table View (`v_all_events`)**:
-  - Unified view combining all event tables with columns: `profile_id`, `event_time`, `event_timestamp`, `event_type`, `description`, `screen_name`, `log_source`, `session_id`, `autonym_script`.
-  - Ideal for cross-screen sequences, funnels, and user timelines.
-
-- **Drop-offs & Funnels**:
-  - To find users who did action A but not action B, use `WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM ...)` or compare stage counts.
+  - `question_id` contains the English question text; `answer_id` contains normalized answer code.
+- **Onboarding Completion (`onboarding_complete_screen`)**:
+  - The final step where a user finishes the entire onboarding flow is logged as `screen_name = 'onboarding_complete_screen'`.
+  - When the user asks "how many users completed all onboarding steps" or "completed onboarding":
+    Query `"v_all_events"` with `WHERE "screen_name" = 'onboarding_complete_screen'`.
+  - If filtered by app version (e.g. 'version 4.0.0'):
+    JOIN `"app_lifecycle_events"` ON "profile_id" WHERE "app_version" = '4.0.0'.
 
 FEW-SHOT EXAMPLES:
+User: How many users have completed all onboarding steps till now in version 4.0.0?
+SQL: SELECT COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = '4.0.0' AND v."screen_name" = 'onboarding_complete_screen';
+
+User: How many users opened language screen and how many reached category screen please do a comparison?
+SQL: SELECT 'Language Screen' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE '%language_list%' UNION ALL SELECT 'Category Screen' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE '%category_list%' ORDER BY "user_count" DESC;
+
 User: How many users viewed category screen
 SQL: SELECT COUNT(DISTINCT "profile_id") FROM "download_category_events";
 

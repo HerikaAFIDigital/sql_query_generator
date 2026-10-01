@@ -1,0 +1,2 @@
+﻿id;session_id;profile_id;event_type;description;screen_name;event_timestamp;question_id;answer_id;is_local_user;source_file;ingested_at
+385428e0-47a0-490e-9cda-56088a9c683a;de9a05fe-9451-4bec-abce-d5798eb56415;BWU-FXC-FUO-TLW-U1;selected;User answered question: Are you a healthcare professional (or studying to become one)?;user_onboarding_questions_screen;1790318666588;Are you a healthcare professional (or studying to become one)?;no;;BWU-FXC-FUO-TLW-U1_de9a05fe-9451-4bec-abce-d5798eb56415;2026-09-25 12:00:14.640316+00

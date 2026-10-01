@@ -258,8 +258,12 @@ class UserJourneyEngine:
             '''
             params = []
             if profile_id:
-                query += " AND profile_id = %s"
-                params.append(profile_id)
+                if isinstance(profile_id, (list, tuple, set)):
+                    query += " AND profile_id = ANY(%s)"
+                    params.append(list(profile_id))
+                else:
+                    query += " AND profile_id = %s"
+                    params.append(str(profile_id))
 
             cur.execute(query, tuple(params))
             col_names = [d[0] for d in cur.description]
@@ -1497,9 +1501,10 @@ def parse_journey_query(query: str, available_dates: list = None):
     if not is_journey and ("report" in q and ("user" in q or "date" in q)):
         is_journey = True
 
-    # Check for specific profile ID format
-    pid_match = re.search(r'\b[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{2}\b', query, re.IGNORECASE)
-    pid = pid_match.group(0).upper() if pid_match else None
+    # Check for specific profile ID format (extract ALL profile IDs mentioned)
+    pid_matches = re.findall(r'\b[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{2}\b', query, re.IGNORECASE)
+    pids = [p.upper() for p in pid_matches] if pid_matches else None
+    pid = pids[0] if pids and len(pids) == 1 else pids
 
     # Check for date in format YYYY-MM-DD
     date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', query)
@@ -1511,8 +1516,8 @@ def parse_journey_query(query: str, available_dates: list = None):
     elif "today" in q and available_dates:
         date_val = available_dates[0]
     elif is_journey and not date_val:
-        # Default to latest active date if available
-        date_val = available_dates[0] if available_dates else "all"
+        # Default to all if specific users are requested; else default to latest active date
+        date_val = "all" if pid else (available_dates[0] if available_dates else "all")
 
     return is_journey, date_val, pid
 
