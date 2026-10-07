@@ -151,6 +151,69 @@ def create_unified_view(engine, created_tables: list = None):
         print(f"  Created unified view 'v_all_events' across {len(queries)} event table(s).")
 
 
+def create_semantic_views(engine):
+    """Creates normalized analytical data-mart views to make text-to-SQL reliable and scalable."""
+    semantic_views = [
+        (
+            "v_category_downloads",
+            """
+            CREATE OR REPLACE VIEW v_category_downloads AS
+            SELECT 
+                profile_id,
+                event_time,
+                jsonb_array_elements_text(selected_category_titles::jsonb) AS category_name,
+                total_selected::integer AS categories_in_batch,
+                language_id,
+                autonym_script
+            FROM download_category_events
+            WHERE event_type = 'downloaded' 
+              AND selected_category_titles IS NOT NULL 
+              AND selected_category_titles <> '[]';
+            """
+        ),
+        (
+            "v_survey_answers",
+            """
+            CREATE OR REPLACE VIEW v_survey_answers AS
+            SELECT 
+                profile_id,
+                session_id,
+                event_time,
+                question_id AS question,
+                answer_id AS answer
+            FROM onboarding_events
+            WHERE question_id IS NOT NULL;
+            """
+        ),
+        (
+            "v_quiz_results",
+            """
+            CREATE OR REPLACE VIEW v_quiz_results AS
+            SELECT 
+                profile_id,
+                event_time,
+                module_title,
+                score::numeric AS score_percent,
+                stars,
+                level,
+                event_type AS result_status
+            FROM learning_results
+            WHERE module_title IS NOT NULL;
+            """
+        ),
+    ]
+
+    with engine.begin() as conn:
+        for view_name, sql in semantic_views:
+            try:
+                conn.execute(text(sql))
+                conn.execute(text(f'GRANT SELECT ON "{view_name}" TO "{READONLY_USER}"'))
+                print(f"  Created semantic view '{view_name}' and granted SELECT to '{READONLY_USER}'.")
+            except Exception as e:
+                print(f"  Notice: could not create view '{view_name}': {e}")
+
+
+
 def ingest_csv_directory(csv_folder: str = CSV_FOLDER, engine=None) -> dict:
     """Ingests all CSVs in csv_folder into PostgreSQL with indexing and permissions."""
     if not PG_ADMIN_USER or not PG_ADMIN_PASSWORD:
@@ -209,6 +272,7 @@ def ingest_csv_directory(csv_folder: str = CSV_FOLDER, engine=None) -> dict:
         print(f"\nGranted SELECT on {len(created_tables)} table(s) to '{READONLY_USER}'.")
 
     create_unified_view(engine, created_tables)
+    create_semantic_views(engine)
 
     return {
         "status": "ok",

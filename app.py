@@ -120,6 +120,12 @@ TABLE_NOTES = """
 - **Category Screen (`category_list_screen`)**:
   - Logged in table `"download_category_events"` (and in `"v_all_events"` where `screen_name = 'category_list_screen'`).
   - Verbs / event_types: 'selected', 'downloaded', 'interacted', 'started'.
+  - CRITICAL NOTE ON 'downloaded' EVENT:
+    * When `event_type = 'downloaded'`, `category_title` is NULL!
+    * Downloaded categories are in `selected_category_titles` (JSON array) and count is in `total_selected` ('1' to '5').
+    * Total categories = 5.
+    * Users who downloaded all categories: `WHERE event_type = 'downloaded' AND total_selected = '5'` (10 users).
+    * Users who downloaded any category: `WHERE event_type = 'downloaded'` (16 users).
 - **App Install / Launch (`splash_screen`)**:
   - Logged in table `"app_lifecycle_events"`.
   - Columns: `device_model`, `device_os`, `app_version`, `app_id`, `location_lat`, `location_long`, `language_version`.
@@ -162,6 +168,12 @@ SQL: SELECT COUNT(DISTINCT "profile_id") FROM "terms_conditions_events" WHERE "e
 
 User: How many users installed the app but dropped off before category screen?
 SQL: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a WHERE a."profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_category_events");
+
+User: How many users downloaded all categories?
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "users_downloaded_all_categories" FROM "download_category_events" WHERE "event_type" = 'downloaded' AND "total_selected" = '5';
+
+User: Which users downloaded all categories?
+SQL: SELECT DISTINCT "profile_id" FROM "download_category_events" WHERE "event_type" = 'downloaded' AND "total_selected" = '5' ORDER BY "profile_id";
 """
 
 

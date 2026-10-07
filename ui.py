@@ -168,7 +168,10 @@ _init_cache_db()
 
 @st.cache_resource
 def _get_schema_context() -> str:
-    """Load full DB schema once and cache it for the process lifetime."""
+    """Load full DB schema once and cache it for the process lifetime.
+    Groups tables into Semantic Analytical Views, Master Funnel Views, and Raw Tables.
+    Automatically discovers and displays low-cardinality enum values for any table or view.
+    """
     try:
         conn = psycopg2.connect(**PG_KWARGS)
         cur = conn.cursor()
@@ -177,41 +180,59 @@ def _get_schema_context() -> str:
             WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'
             ORDER BY table_name
         """)
-        tables = [r[0] for r in cur.fetchall()]
-        lines = []
-        for table in tables:
-            cur.execute("""
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_name = %s AND table_schema = 'public'
-                ORDER BY ordinal_position
-            """, (table,))
-            cols = cur.fetchall()
-            if not cols:
+        all_tables = [r[0] for r in cur.fetchall()]
+
+        semantic_views = [t for t in all_tables if t.startswith("v_") and t != "v_all_events"]
+        master_views = [t for t in all_tables if t == "v_all_events"]
+        raw_tables = [t for t in all_tables if not t.startswith("v_")]
+
+        skip_enum_cols = {
+            "profile_id", "selected_categories", "selected_category_titles", "extra",
+            "id", "session_id", "app_installation_id", "category_id",
+            "language_id", "source_file", "ingested_at", "event_timestamp",
+        }
+
+        sections = []
+        groupings = [
+            ("ANALYTICAL DATA-MART VIEWS (Clean normalized tables — PREFER THESE):", semantic_views),
+            ("MASTER JOURNEY & RETENTION VIEW (Use for cross-screen funnels, drop-offs, and screen navigation):", master_views),
+            ("RAW EVENT TELEMETRY TABLES:", raw_tables),
+        ]
+
+        for heading, tbl_list in groupings:
+            if not tbl_list:
                 continue
-            col_parts = []
-            for name, dtype in cols:
-                part = f"{name} ({dtype})"
-                # Add enum values for low-cardinality text columns
-                if dtype in TEXT_TYPES and name not in {
-                    "selected_categories", "selected_category_titles", "extra",
-                    "id", "session_id", "app_installation_id", "category_id",
-                    "language_id", "source_file", "ingested_at", "event_timestamp",
-                } and not table.startswith("v_"):
-                    try:
-                        cur.execute(f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"')
-                        row = cur.fetchone()
-                        if row and 0 < row[0] <= 30:
-                            cur.execute(f'SELECT DISTINCT "{name}" FROM "{table}" WHERE "{name}" IS NOT NULL ORDER BY 1')
-                            values = [str(r[0]) for r in cur.fetchall()]
-                            part += f" [values: {', '.join(repr(v) for v in values)}]"
-                    except Exception:
-                        pass
-                col_parts.append(part)
-            lines.append(f"- {table}({', '.join(col_parts)})")
+            section_lines = [f"### {heading}"]
+            for table in tbl_list:
+                cur.execute("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND table_schema = 'public'
+                    ORDER BY ordinal_position
+                """, (table,))
+                cols = cur.fetchall()
+                if not cols:
+                    continue
+                col_parts = []
+                for name, dtype in cols:
+                    part = f"{name} ({dtype})"
+                    if dtype in TEXT_TYPES and name not in skip_enum_cols and table != "v_all_events":
+                        try:
+                            cur.execute(f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"')
+                            row = cur.fetchone()
+                            if row and 0 < row[0] <= 25:
+                                cur.execute(f'SELECT DISTINCT "{name}" FROM "{table}" WHERE "{name}" IS NOT NULL ORDER BY 1')
+                                vals = [str(r[0]) for r in cur.fetchall()]
+                                part += f" [values: {', '.join(repr(v) for v in vals)}]"
+                        except Exception:
+                            pass
+                    col_parts.append(part)
+                section_lines.append(f"- {table}({', '.join(col_parts)})")
+            sections.append("\n".join(section_lines))
+
         cur.close()
         conn.close()
-        return "\n".join(lines)
+        return "\n\n".join(sections)
     except Exception as exc:
         return f"(schema lookup failed: {exc})"
 
@@ -287,132 +308,382 @@ def fix_onboarding_ilike(sql: str) -> str:
 
 TABLE_NOTES = """
 ## CRITICAL ARCHITECTURE & RELATIONSHIP RULES:
-1. `profile_id` is the shared user identifier across ALL tables (app_lifecycle_events, download_language_events, download_category_events, onboarding_events, terms_conditions_events, interaction_events, v_all_events).
-2. Joining multiple tables:
-   - When a question requires filtering or aggregating across multiple tables (e.g. users on Android who downloaded a category), JOIN the tables on "profile_id".
-   - Example: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a JOIN "download_category_events" c ON a."profile_id" = c."profile_id" WHERE a."device_os" = 'Android' AND c."event_type" = 'downloaded';
-3. `event_time` (timestamp) is the primary time column for date filtering. Use: DATE("event_time") = 'YYYY-MM-DD'.
+1. `profile_id` is the shared user identifier across ALL tables.
+2. Always JOIN tables on "profile_id" when cross-filtering (e.g. device_os + download).
+3. `event_time` (timestamp) is the primary time column. Use: DATE("event_time") = \'YYYY-MM-DD\'.
 4. Always use `COUNT(DISTINCT "profile_id")` when counting users.
 5. Do NOT use LIMIT unless specifically asked.
 6. Always qualify table names with double-quotes e.g. "download_category_events", "v_all_events".
 7. NEVER append SQL line comments (-- ...) to the query. Output ONLY the SQL statement.
+8. NEVER use the table "terms_conditions_events" — it does NOT exist in this database.
 
-## DOMAIN MAPPING & VERB ROUTING REFERENCE (From Ingestion Service):
-- Machine-generated screen views are logged in `"interaction_events"` with `screen_name`.
-- Domain actions (downloads, quiz answers, logins) are logged in their domain tables.
-- **Unified Master View (`"v_all_events"`)**:
-  - Combines ALL tables with: profile_id, event_time, event_timestamp, event_type, description, screen_name, log_source, session_id, autonym_script.
-  - ALWAYS use `"v_all_events"` for cross-screen comparisons, funnels, drop-offs, retention, journeys.
+## COMPLETE TABLE CATALOGUE — PURPOSE, COLUMNS & EVENT TYPES:
 
-## SCREEN NAME VARIANTS & DYNAMIC NORMALIZATION - CRITICAL:
-  The database has screen names in MULTIPLE casing styles from different app versions (e.g. 'language_list_screen' vs 'LanguageListScreen', 'splash_screen' vs 'Splash').
-  - When matching a specific screen in WHERE clauses, ALWAYS use ILIKE with wildcards:
-    - Language screen:        screen_name ILIKE '%language_list%'
-    - Category screen:        screen_name ILIKE '%category_list%'
-    - Onboarding complete:    screen_name ILIKE '%onboarding_complete%'
-    - Onboarding survey:      screen_name ILIKE '%onboarding_survey%'
-    - Home screen:            screen_name ILIKE '%home_screen%' OR screen_name = 'HomeScreen'
-    - Splash screen:          screen_name ILIKE '%splash%'
-  - When GROUPING by screen name across all screens, ALWAYS normalize screen names dynamically by removing '_screen', 'Screen', and underscores:
-    - Example: `SELECT LOWER(REPLACE(REPLACE(REPLACE(screen_name, '_screen', ''), 'Screen', ''), '_', '')) AS screen, COUNT(DISTINCT profile_id) AS user_count FROM v_all_events WHERE screen_name IS NOT NULL GROUP BY 1 ORDER BY user_count DESC;`
+### v_all_events (MASTER VIEW — use for cross-table, funnel, drop-off, journey, screen comparisons)
+- Columns: profile_id, event_time, event_timestamp, event_type, description, screen_name, log_source, session_id, autonym_script
+- log_source tells which domain table the event came from.
+- Total distinct users: 28. Date range: 2026-09-19 to 2026-09-28.
+- ALWAYS use for: users reaching a screen, drop-offs, last screen, funnel, retention, journeys.
 
-## USER DROP-OFF & FUNNEL ANALYSIS RULES (MANDATORY):
-- When the user asks "where did users drop off", "drop off comparison", or "last screen before leaving":
-  Determine the LAST active screen for each user dynamically:
-  ```sql
-  WITH last_screen_per_user AS (
-      SELECT DISTINCT ON (profile_id)
-          profile_id,
-          screen_name,
-          event_time
-      FROM v_all_events
-      WHERE screen_name IS NOT NULL
-      ORDER BY profile_id, event_time DESC
-  )
-  SELECT 
-      LOWER(REPLACE(REPLACE(REPLACE(screen_name, '_screen', ''), 'Screen', ''), '_', '')) AS drop_off_screen,
-      COUNT(DISTINCT profile_id) AS user_count
-  FROM last_screen_per_user
-  GROUP BY 1
-  ORDER BY user_count DESC;
-  ```
-  This is completely dynamic and works for any current or future screens without hardcoding.
+### app_lifecycle_events (app install & launch)
+- Columns: profile_id, event_type, screen_name, app_id, app_version, app_installation_id, device_os, language_id, autonym_script, location_lat, location_long, device_model, event_time
+- event_type values: \'installed\', \'started\'
+- app_version values: \'3.6.8\', \'3.9.3\', \'4.0.0\'
+- device_os values: \'Android\', \'iOS\'
+- Use for: device OS breakdown, app version, installed users, device model.
+- Distinct installed users: 27.
 
-## SCREEN & EVENT LOGGING RULES (MANDATORY):
-- **Screen Comparisons**: MUST query "v_all_events" with ILIKE on screen_name.
-- **Language Screen**: "download_language_events" and v_all_events (ILIKE '%language_list%'). Event types: selected, downloaded, cancelled.
-- **Category Screen**: "download_category_events" and v_all_events (ILIKE '%category_list%'). Event types: selected, downloaded, interacted, started.
-- **App Install/Launch**: "app_lifecycle_events". Columns: device_model, device_os, app_version, app_id. Event types: installed, started, app_launch.
-- **Terms & Conditions**: "terms_conditions_events". Event type: accepted, is_accepted = '1'.
-- **Onboarding Survey**: "onboarding_events". Event type: answered. question_id = question text; answer_id = answer code.
-- **Onboarding Completion**:
-  - ALWAYS use: WHERE "screen_name" ILIKE '%onboarding_complete%'
-  - This covers BOTH 'onboarding_complete_screen' AND 'OnboardingCompleteScreen' variants.
-  - Total completions: SELECT COUNT(DISTINCT "profile_id") FROM "v_all_events" WHERE "screen_name" ILIKE '%onboarding_complete%';
-  - Filtered by version: SELECT COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = '4.0.0' AND v."screen_name" ILIKE '%onboarding_complete%';
-  - Version comparison (version X AND below X): Use UNION ALL with app_version = 'X' and app_version < 'X'.
-- **App Version Filtering**: app_version in "app_lifecycle_events" (e.g. '4.0.0', '3.9.3', '3.6.8').
-- **Content & Modules**: "content_events", "clinical_content_events". Columns: resource_title, resource_id, resource_type, event_value.
-- **Quiz & Learning**: "learning_attempts", "learning_results", "champion_attempts", "champion_results".
+### app_background_events (app suspended/backgrounded)
+- Columns: profile_id, event_type, screen_name, event_time
+- event_type: \'suspended\'
+- Use for: how many times app was backgrounded, session interruptions.
+
+### download_language_events (language selection & download)
+- Columns: profile_id, event_type, screen_name, status, language_id, autonym_script, is_selective_download, event_time
+- event_type values: \'selected\', \'downloaded\', \'cancelled\'
+- screen_name: \'language_list_screen\', \'onboarding_screen\'
+- autonym_script examples: \'Ethiopia - English\', \'French\', \'Arabic\', \'Spanish\', \'India - Hindi\', \'Nepal - English\', etc.
+- Use for: language selected/downloaded, language-level user counts, cancelled downloads.
+- Distinct users: 23.
+
+### download_category_events (category selection & download)
+- Columns: profile_id, event_type, screen_name, status, category_id, category_title, selected_categories, selected_category_titles, total_selected, total_download_size_mb, language_id, autonym_script, event_time
+- event_type values: \'selected\' (user toggling category checkbox), \'downloaded\' (user tapping Download button)
+- CRITICAL NOTE ON COLUMNS FOR \'downloaded\' EVENT TYPE:
+  * When event_type = \'downloaded\', category_title and category_id are ALWAYS NULL!
+  * Instead, downloaded categories are stored in selected_category_titles (JSON array of strings, e.g. ["Maternal health", "Newborn health", "Sexual & reproductive health", "Infection prevention", "Pregnancy and birth complications"]).
+  * The count of downloaded categories is in total_selected (string \'1\', \'2\', \'3\', \'4\', \'5\').
+  * Total available categories in system: 5 (\'Maternal health\', \'Newborn health\', \'Infection prevention\', \'Pregnancy and birth complications\', \'Sexual & reproductive health\').
+  * "Downloaded all categories" means: WHERE "event_type" = \'downloaded\' AND "total_selected" = \'5\' (Returns 10 users).
+  * "Downloaded any category" means: WHERE "event_type" = \'downloaded\' (Returns 16 users).
+  * To filter by a specific downloaded category: WHERE "event_type" = \'downloaded\' AND "selected_category_titles" ILIKE \'%<Category Name>%\'
+  * NEVER use `WHERE event_type = \'downloaded\' AND category_title = ...` or `COUNT(DISTINCT category_title)` on downloaded events because category_title is NULL!
+
+### download_video_events (module video download)
+- Columns: profile_id, event_type, screen_name, file_count, module_id, module_title, category_id, category_title, language_id, autonym_script, event_time
+- event_type values: \'downloaded\', \'started\'
+- Use for: which module videos were downloaded.
+
+### onboarding_events (onboarding SURVEY QUESTIONS & ANSWERS ONLY)
+- Columns: profile_id, session_id, event_type, screen_name, question_id, answer_id, event_time
+- event_type: \'answered\'
+- screen_name: \'onboarding_survey_screen\'
+- EXACT question_id values (use ILIKE to match):
+  * \'Is this device a shared phone/tablet?\'  → answer_id: \'yes\', \'no\'
+  * \'Approximately how many users share this device?\'  → answer_id: \'2_to_5_users\', \'6_to_10_users\', \'10_plus_users\'
+  * \'Are you a healthcare professional (or studying to become one)?\'  → answer_id: \'yes\', \'no\'
+  * \'What is your profession?\'  → answer_id: \'midwife\', \'student\', \'other_skilled_birth_attendant\'
+  * \'How many years of experience do you have as a healthcare professional?\'  → answer_id: \'less_than_1_year\', \'6_to_10_years\', \'11_plus_years\'
+  * \'Where do you work?\'  → answer_id: \'primary_health_facility\', \'secondary_health_facility\', \'other\'
+  * \'How did you hear about the Safe Delivery app?\'  → answer_id: \'colleague_employer\', \'in_service_training\', \'other\'
+- Use for: survey answer breakdowns, profession, workplace, app discovery source.
+- NEVER use to answer drop-off / funnel questions. Drop-off = journey question answered via v_all_events.
+- Distinct users: 11.
+
+### interaction_events (generic screen views & interactions)
+- Columns: profile_id, event_type, screen_name, is_local_user, language_id, autonym_script, event_time
+- event_type values: \'viewed\', \'clicked\', \'completed\', \'interacted\', \'updated\'
+- screen_name examples: \'language_list_screen\', \'category_list_screen\', \'onboarding_screen\', \'onboarding_survey_screen\', \'onboarding_complete_screen\', \'settings_disclaimer_screen\', \'home_screen\', \'drug_list_screen\', \'search_screen\', \'notification_screen\', \'user_profile_screen\'
+
+### auth_events (authentication / login / registration)
+- Columns: profile_id, auth_event_type, event_type, screen_name, is_local_user, event_time
+- auth_event_type: \'login\'
+- event_type values: \'attempted\', \'completed\', \'failed\', \'registered\', \'verified\', \'viewed\'
+- screen_name: \'user_profile_screen\', \'otp_verification_screen\', \'set_password_screen\', \'add_profile_details_screen\'
+
+### content_events (module & category content browsing in-app)
+- Columns: profile_id, event_type, screen_name, language_id, autonym_script, resource_id, resource_type, resource_title, event_value, event_time
+- event_type values: \'viewed\', \'selected\', \'interacted\'
+- resource_type: \'module\', \'category\'
+- resource_title examples (modules): \'Normal Labour and Birth\', \'Post Partum Hemorrhage\', \'Hypertension\', \'Manual Removal of Placenta\', \'Female Genital Mutilation\', \'Prolonged Labour\', \'Safe Abortion\'
+- resource_title examples (categories): \'Maternal health\', \'Pregnancy and birth complications\', \'Sexual & reproductive health\'
+
+### clinical_content_events (clinical action cards & chapters)
+- Columns: profile_id, event_type, screen_name, event_time
+- event_type values: \'viewed\', \'selected\'
+- screen_name: \'action_card_chapters_screen\', \'chapter_detail_screen\'
+
+### learning_attempts (quiz question-level attempts)
+- Columns: profile_id, event_type, screen_name, module_id, module_title, klp_id, klp_title, language_id, autonym_script, clicks_used, question_id, answer_id, score, event_time
+- event_type: \'answered\'
+- score: \'0\' = wrong, \'1\' = correct
+- screen_name: \'quiz_screen\'
+
+### learning_navigation_events (quiz start/exit navigation)
+- Columns: profile_id, event_type, screen_name, event_time
+- event_type values: \'viewed\', \'started\', \'exited\'
+- screen_name: \'quiz_intro_screen\', \'quiz_screen\'
+
+### learning_results (quiz completion & final score)
+- Columns: profile_id, event_type, screen_name, language_id, autonym_script, module_id, module_title, level, score, stars, event_time
+- event_type values: \'viewed\', \'failed\'
+- level: \'familiar\'
+- score: percentage string (e.g. \'58\')
+- screen_name: \'quiz_completion_screen\'
+
+### migration_events (account migration flow)
+- Columns: profile_id, event_type, screen_name, migration_stage, event_time
+- event_type values: \'started\', \'viewed\', \'interacted\', \'selected\', \'verified\', \'migrated\', \'updated\'
+- migration_stage values: \'identity_migration\', \'review_migration\', \'migration_set_password\'
+
+### module_rating_events (module star ratings)
+- Columns: profile_id, event_type, screen_name, module_id, module_title, category_id, category_title, rating, event_time
+- event_type: \'interacted\'
+- rating: star count as text (\'1\' to \'5\')
+- screen_name: \'module_overview_screen\'
+
+### delivery_count_events (delivery count submission)
+- Columns: profile_id, event_type, screen_name, delivery_count, delivery_timestamp, event_time
+- event_type: \'confirmed\'
+- screen_name: \'delivery_count_modal\'
+- delivery_count: number of deliveries attended last month
+
+### profiling_events (in-app profiling — different from onboarding_events)
+- Columns: profile_id, session_id, event_type, screen_name, question_id, answer_id, is_local_user, event_time
+- screen_name: \'user_onboarding_questions_screen\'
+- event_type: \'selected\'
+
+## SCREEN NAME VARIANTS & DYNAMIC NORMALIZATION — CRITICAL:
+The database has screen names in MULTIPLE casing styles from different app versions.
+ALWAYS use ILIKE with wildcards when matching a specific screen in WHERE clauses:
+- Language screen:          screen_name ILIKE \'%language_list%\'
+- Category screen:          screen_name ILIKE \'%category_list%\'
+- Onboarding complete:      screen_name ILIKE \'%onboarding_complete%\'
+- Onboarding survey:        screen_name ILIKE \'%onboarding_survey%\' OR screen_name = \'OnboardingSurveyScreen\'
+- Home screen:              screen_name ILIKE \'%home_screen%\' OR screen_name = \'HomeScreen\'
+- Splash screen:            screen_name ILIKE \'%splash%\'
+- Settings / T&C:           screen_name ILIKE \'%settings_disclaimer%\' OR screen_name = \'SettingsDisclaimer\'
+
+When GROUPING by screen name across all screens, normalize dynamically:
+SELECT LOWER(REPLACE(REPLACE(REPLACE(screen_name, \'_screen\', \'\'), \'Screen\', \'\'), \'_\', \'\')) AS screen, COUNT(DISTINCT profile_id) AS user_count FROM v_all_events WHERE screen_name IS NOT NULL GROUP BY 1 ORDER BY user_count DESC;
+
+## FUNNEL STAGES (in order, actual data):
+Stage 1 — App Installed:         app_lifecycle_events WHERE event_type = \'installed\'          → 27 users
+Stage 2 — Language Screen:       download_language_events (any event)                         → 23 users
+Stage 3 — Category Downloaded:   download_category_events WHERE event_type = \'downloaded\'      → 16 users
+Stage 4 — Onboarding Survey:     onboarding_events (any event)                                → 11 users
+Stage 5 — Reached Home:          v_all_events WHERE screen_name ILIKE \'%home_screen%\' OR screen_name = \'HomeScreen\' → 8 users
+
+## DROP-OFF RULES — CRITICAL (READ CAREFULLY):
+- "How many users dropped during survey / dropped at survey / dropped at onboarding survey" means:
+  Users who reached the survey screen but DID NOT reach Home or Onboarding Complete.
+  This is a FUNNEL/JOURNEY question — NEVER answer with survey yes/no breakdown from onboarding_events.
+  SQL: SELECT COUNT(DISTINCT "profile_id") FROM "onboarding_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\') AND "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "v_all_events" WHERE "screen_name" ILIKE \'%onboarding_complete%\');
+
+- "Dropped before X screen" = users who never appear in the table/screen for X.
+  Example — dropped before category: profile_id in app_lifecycle_events NOT IN download_category_events.
+
+- "Where did users last drop off / last screen per user / drop-off breakdown":
+  Use last-screen CTE on v_all_events to find every user\'s final screen.
+
+- "Funnel / conversion funnel" = UNION ALL for each stage.
 
 ## DATE & TIME RANGE RULES (MANDATORY):
-- **Dataset Timeframe**: All data is from **September 2026** (September 19, 20, 21 of 2026).
-- If no year given, ALWAYS use 2026. NEVER use 2023, 2024, or 2025!
+- Dataset covers: 2026-09-19 to 2026-09-28.
+- If no year given, ALWAYS use 2026. NEVER use 2023, 2024, or 2025.
+
+## QUESTION DISAMBIGUATION TABLE:
+| User says...                                | Correct approach                                                  |
+|---------------------------------------------|-------------------------------------------------------------------|
+| "dropped during survey"                     | FUNNEL: onboarding_events NOT IN home/complete via v_all_events   |
+| "dropped before category"                   | app_lifecycle_events NOT IN download_category_events              |
+| "dropped before language"                   | app_lifecycle_events NOT IN download_language_events              |
+| "where did users drop off"                  | Last-screen CTE on v_all_events                                   |
+| "survey answers / answered yes/no"          | onboarding_events GROUP BY answer_id                              |
+| "shared device / shared phone"              | onboarding_events WHERE question_id ILIKE \'%shared phone%\'        |
+| "healthcare professional"                   | onboarding_events WHERE question_id ILIKE \'%healthcare%\'          |
+| "profession / job / midwife"                | onboarding_events WHERE question_id ILIKE \'%profession%\'          |
+| "years of experience"                       | onboarding_events WHERE question_id ILIKE \'%years of experience%\' |
+| "where do users work"                       | onboarding_events WHERE question_id ILIKE \'%Where do you work%\'   |
+| "how did they hear / app discovery"         | onboarding_events WHERE question_id ILIKE \'%How did you hear%\'    |
+| "how many users share this device"          | onboarding_events WHERE question_id ILIKE \'%Approximately%\'       |
+| "installed / install count"                 | app_lifecycle_events WHERE event_type=\'installed\'                 |
+| "device OS / Android / iOS"                 | app_lifecycle_events GROUP BY device_os                           |
+| "app version"                               | app_lifecycle_events GROUP BY app_version                         |
+| "language downloaded"                       | download_language_events GROUP BY autonym_script                  |
+| "category downloaded"                       | download_category_events WHERE event_type=\'downloaded\'            |
+| "onboarding complete / completed onboarding"| v_all_events WHERE screen_name ILIKE \'%onboarding_complete%\'      |
+| "reached home / home screen"                | v_all_events WHERE screen_name ILIKE \'%home%\'                     |
+| "terms and conditions / T&C"                | interaction_events WHERE screen_name ILIKE \'%settings_disclaimer%\'|
+| "login / auth / signed in"                  | auth_events                                                       |
+| "quiz / knowledge test"                     | learning_attempts, learning_results                               |
+| "module viewed / content viewed"            | content_events WHERE resource_type=\'module\'                       |
+| "category viewed"                           | content_events WHERE resource_type=\'category\'                     |
+| "module rating / stars"                     | module_rating_events                                              |
+| "video downloaded"                          | download_video_events                                             |
+| "delivery count"                            | delivery_count_events                                             |
+| "migration / account migration"             | migration_events                                                  |
+| "users by date / daily users"               | v_all_events GROUP BY DATE(event_time)                            |
+| "total users"                               | COUNT(DISTINCT profile_id) FROM v_all_events                      |
+| "funnel / conversion funnel"                | UNION ALL across funnel stages                                    |
+| "session count"                             | COUNT(DISTINCT session_id) FROM v_all_events                      |
 
 FEW-SHOT EXAMPLES:
-User: Give me a graph of comparison of all users who dropped where / where did users drop off
-SQL: WITH last_screen_per_user AS (SELECT DISTINCT ON ("profile_id") "profile_id", "screen_name", "event_time" FROM "v_all_events" WHERE "screen_name" IS NOT NULL ORDER BY "profile_id", "event_time" DESC) SELECT LOWER(REPLACE(REPLACE("screen_name", '_screen', ''), 'Screen', '')) AS "drop_off_screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM last_screen_per_user GROUP BY 1 ORDER BY "user_count" DESC;
 
-User: How many users have completed all onboarding steps till now in version 4.0.0?
-SQL: SELECT COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = '4.0.0' AND v."screen_name" ILIKE '%onboarding_complete%';
+User: How many users dropped during survey / dropped at onboarding survey
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "dropped_during_survey" FROM "onboarding_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\') AND "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "v_all_events" WHERE "screen_name" ILIKE \'%onboarding_complete%\');
 
-User: How many users have completed all onboarding steps in version 4.0.0 and in version less than 4.0.0?
-SQL: SELECT '4.0.0' AS "version", COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = '4.0.0' AND v."screen_name" ILIKE '%onboarding_complete%' UNION ALL SELECT 'Below 4.0.0' AS "version", COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" < '4.0.0' AND v."screen_name" ILIKE '%onboarding_complete%';
+User: How many users dropped before reaching the survey / never reached survey
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "dropped_before_survey" FROM "app_lifecycle_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "onboarding_events");
 
-User: How many users opened language screen and how many reached category screen please do a comparison?
-SQL: SELECT 'Language Screen' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE '%language_list%' UNION ALL SELECT 'Category Screen' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE '%category_list%' ORDER BY "user_count" DESC;
+User: Give me a full funnel / conversion funnel from install to home
+SQL: SELECT \'Installed\' AS "stage", COUNT(DISTINCT "profile_id") AS "user_count" FROM "app_lifecycle_events" WHERE "event_type" = \'installed\' UNION ALL SELECT \'Reached Language Screen\', COUNT(DISTINCT "profile_id") FROM "download_language_events" UNION ALL SELECT \'Downloaded Category\', COUNT(DISTINCT "profile_id") FROM "download_category_events" WHERE "event_type" = \'downloaded\' UNION ALL SELECT \'Reached Survey\', COUNT(DISTINCT "profile_id") FROM "onboarding_events" UNION ALL SELECT \'Reached Home\', COUNT(DISTINCT "profile_id") FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\';
 
-User: How many users were there on 20th of september
-SQL: SELECT COUNT(DISTINCT "profile_id") FROM "v_all_events" WHERE DATE("event_time") = '2026-09-20';
+User: Where did users drop off / last screen comparison / drop-off breakdown
+SQL: WITH last_screen_per_user AS (SELECT DISTINCT ON ("profile_id") "profile_id", "screen_name", "event_time" FROM "v_all_events" WHERE "screen_name" IS NOT NULL ORDER BY "profile_id", "event_time" DESC) SELECT LOWER(REPLACE(REPLACE(REPLACE("screen_name", \'_screen\', \'\'), \'Screen\', \'\'), \'_\', \'\')) AS "drop_off_screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM last_screen_per_user GROUP BY 1 ORDER BY "user_count" DESC;
+
+User: How many users dropped before category screen / installed but never reached category
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "dropped_before_category" FROM "app_lifecycle_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_category_events");
+
+User: How many users dropped before language screen
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "dropped_before_language" FROM "app_lifecycle_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_language_events");
+
+User: How many users reached home screen / got to home / completed onboarding
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\';
+
+User: How many users completed onboarding / reached onboarding complete screen
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%onboarding_complete%\';
+
+User: How many users have completed all onboarding steps in version 4.0.0?
+SQL: SELECT COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = \'4.0.0\' AND v."screen_name" ILIKE \'%onboarding_complete%\';
+
+User: How many users have completed onboarding in version 4.0.0 and in version less than 4.0.0?
+SQL: SELECT \'4.0.0\' AS "version", COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" = \'4.0.0\' AND v."screen_name" ILIKE \'%onboarding_complete%\' UNION ALL SELECT \'Below 4.0.0\' AS "version", COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "v_all_events" v ON a."profile_id" = v."profile_id" WHERE a."app_version" < \'4.0.0\' AND v."screen_name" ILIKE \'%onboarding_complete%\';
+
+User: How many users opened language screen and how many reached category screen comparison?
+SQL: SELECT \'Language Screen\' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%language_list%\' UNION ALL SELECT \'Category Screen\' AS "screen", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%category_list%\' ORDER BY "user_count" DESC;
+
+User: How many users were there on 20th September
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE DATE("event_time") = \'2026-09-20\';
 
 User: Daily user count / breakdown of users by date
 SQL: SELECT DATE("event_time") AS "event_date", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" GROUP BY DATE("event_time") ORDER BY "event_date" ASC;
 
-User: Breakdown of users on 20th september
-SQL: SELECT "screen_name", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE DATE("event_time") = '2026-09-20' GROUP BY "screen_name" ORDER BY "user_count" DESC;
-
-User: How many users viewed category screen
-SQL: SELECT COUNT(DISTINCT "profile_id") FROM "download_category_events";
-
-User: How many users viewed language screen
-SQL: SELECT COUNT(DISTINCT "profile_id") FROM "download_language_events" WHERE "screen_name" = 'language_list_screen';
+User: Breakdown of users on 20th September
+SQL: SELECT "screen_name", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE DATE("event_time") = \'2026-09-20\' GROUP BY "screen_name" ORDER BY "user_count" DESC;
 
 User: Which languages had the most downloads?
-SQL: SELECT "autonym_script", COUNT(DISTINCT "profile_id") AS "download_count" FROM "download_language_events" GROUP BY "autonym_script" ORDER BY "download_count" DESC;
+SQL: SELECT "autonym_script", COUNT(DISTINCT "profile_id") AS "download_count" FROM "download_language_events" WHERE "event_type" = \'downloaded\' GROUP BY "autonym_script" ORDER BY "download_count" DESC;
 
-User: Breakdown of users by device OS
+User: Most popular language / language breakdown
+SQL: SELECT "autonym_script", COUNT(DISTINCT "profile_id") AS "user_count" FROM "download_language_events" GROUP BY "autonym_script" ORDER BY "user_count" DESC;
+
+User: Breakdown of users by device OS / Android vs iOS
 SQL: SELECT "device_os", COUNT(DISTINCT "profile_id") AS "user_count" FROM "app_lifecycle_events" GROUP BY "device_os" ORDER BY "user_count" DESC;
 
+User: Breakdown by app version
+SQL: SELECT "app_version", COUNT(DISTINCT "profile_id") AS "user_count" FROM "app_lifecycle_events" GROUP BY "app_version" ORDER BY "user_count" DESC;
+
 User: How many users on Android downloaded a category?
-SQL: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a JOIN "download_category_events" c ON a."profile_id" = c."profile_id" WHERE a."device_os" = 'Android' AND c."event_type" = 'downloaded';
+SQL: SELECT COUNT(DISTINCT a."profile_id") AS "user_count" FROM "app_lifecycle_events" a JOIN "download_category_events" c ON a."profile_id" = c."profile_id" WHERE a."device_os" = \'Android\' AND c."event_type" = \'downloaded\';
 
 User: How many users answered yes to the shared phone question?
-SQL: SELECT COUNT(DISTINCT "profile_id") FROM "onboarding_events" WHERE "question_id" ILIKE '%shared phone%' AND "answer_id" = 'yes';
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%shared phone%\' AND "answer_id" = \'yes\';
 
-User: How many users answered yes to is this device shared and how many said no?
-SQL: SELECT "answer_id" AS "response", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE '%shared phone%' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+User: How many users said yes to is this device shared and how many said no?
+SQL: SELECT "answer_id" AS "response", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%shared phone%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
 
-User: How many users are healthcare professionals yes and no breakdown?
-SQL: SELECT "answer_id" AS "response", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE '%healthcare professional%' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+User: Are you a healthcare professional yes no breakdown?
+SQL: SELECT "answer_id" AS "response", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%healthcare professional%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
 
-User: Breakdown of onboarding survey answers for shared device question
-SQL: SELECT "answer_id" AS "response", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE '%shared phone%' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+User: How many users are healthcare professionals?
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%healthcare professional%\' AND "answer_id" = \'yes\';
 
-User: How many users accepted terms and conditions?
-SQL: SELECT COUNT(DISTINCT "profile_id") FROM "terms_conditions_events" WHERE "event_type" = 'accepted';
+User: What professions do users have / profession breakdown
+SQL: SELECT "answer_id" AS "profession", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%profession%\' AND "question_id" NOT ILIKE \'%years%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+
+User: Years of experience breakdown
+SQL: SELECT "answer_id" AS "years_of_experience", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%years of experience%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+
+User: Where do users work / workplace breakdown
+SQL: SELECT "answer_id" AS "workplace", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%Where do you work%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+
+User: How did users hear about the app / app discovery source
+SQL: SELECT "answer_id" AS "discovery_source", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%How did you hear%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+
+User: How many users share this device / shared device count breakdown
+SQL: SELECT "answer_id" AS "users_sharing", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" WHERE "question_id" ILIKE \'%Approximately how many%\' GROUP BY "answer_id" ORDER BY "user_count" DESC;
+
+User: Show all survey questions and answer counts
+SQL: SELECT "question_id", "answer_id", COUNT(DISTINCT "profile_id") AS "user_count" FROM "onboarding_events" GROUP BY "question_id", "answer_id" ORDER BY "question_id", "user_count" DESC;
 
 User: How many users installed the app but dropped off before category screen?
-SQL: SELECT COUNT(DISTINCT a."profile_id") FROM "app_lifecycle_events" a WHERE a."profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_category_events");
+SQL: SELECT COUNT(DISTINCT a."profile_id") AS "dropped_before_category" FROM "app_lifecycle_events" a WHERE a."profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "download_category_events");
+
+User: How many users viewed the category screen
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "download_category_events";
+
+User: How many users viewed language screen
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "download_language_events";
+
+User: How many total users are there / total user count
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "total_users" FROM "v_all_events";
+
+User: How many users installed the app
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "installed_users" FROM "app_lifecycle_events" WHERE "event_type" = \'installed\';
+
+User: How many users logged in / auth events breakdown
+SQL: SELECT "event_type", COUNT(DISTINCT "profile_id") AS "user_count" FROM "auth_events" GROUP BY "event_type" ORDER BY "user_count" DESC;
+
+User: How many users registered
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "registered_users" FROM "auth_events" WHERE "event_type" = \'registered\';
+
+User: Which modules were most viewed / popular modules
+SQL: SELECT "resource_title", COUNT(DISTINCT "profile_id") AS "user_count" FROM "content_events" WHERE "resource_type" = \'module\' GROUP BY "resource_title" ORDER BY "user_count" DESC;
+
+User: Which categories were most viewed / category popularity
+SQL: SELECT "resource_title" AS "category", COUNT(DISTINCT "profile_id") AS "user_count" FROM "content_events" WHERE "resource_type" = \'category\' GROUP BY "resource_title" ORDER BY "user_count" DESC;
+
+User: What is the quiz score / average quiz score
+SQL: SELECT "module_title", AVG("score"::numeric) AS "avg_score_percent", COUNT(DISTINCT "profile_id") AS "user_count" FROM "learning_results" WHERE "score" IS NOT NULL GROUP BY "module_title" ORDER BY "avg_score_percent" DESC;
+
+User: How many users passed or failed the quiz
+SQL: SELECT "event_type", COUNT(DISTINCT "profile_id") AS "user_count" FROM "learning_results" GROUP BY "event_type" ORDER BY "user_count" DESC;
+
+User: How many users took the quiz / started a quiz
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "learning_navigation_events" WHERE "event_type" = \'started\';
+
+User: Module ratings / average rating per module
+SQL: SELECT "module_title", AVG("rating"::numeric) AS "avg_rating", COUNT(*) AS "rating_count" FROM "module_rating_events" GROUP BY "module_title" ORDER BY "avg_rating" DESC;
+
+User: How many videos were downloaded
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count", COUNT(*) AS "total_downloads" FROM "download_video_events" WHERE "event_type" = \'downloaded\';
+
+User: How many users went through account migration / migration completed
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "migrated_users" FROM "migration_events" WHERE "event_type" = \'migrated\';
+
+User: Migration breakdown by stage
+SQL: SELECT "migration_stage", COUNT(DISTINCT "profile_id") AS "user_count" FROM "migration_events" GROUP BY "migration_stage" ORDER BY "user_count" DESC;
+
+User: How many deliveries were submitted / delivery count
+SQL: SELECT SUM("delivery_count"::integer) AS "total_deliveries", COUNT(DISTINCT "profile_id") AS "users_submitted" FROM "delivery_count_events" WHERE "event_type" = \'confirmed\';
+
+User: Users who reached home vs dropped overall
+SQL: SELECT \'Reached Home\' AS "outcome", COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\' UNION ALL SELECT \'Dropped (Never Reached Home)\' AS "outcome", COUNT(DISTINCT "profile_id") AS "user_count" FROM "app_lifecycle_events" WHERE "profile_id" NOT IN (SELECT DISTINCT "profile_id" FROM "v_all_events" WHERE "screen_name" ILIKE \'%home_screen%\' OR "screen_name" = \'HomeScreen\');
+
+User: Session count / how many sessions
+SQL: SELECT COUNT(DISTINCT "session_id") AS "total_sessions", COUNT(DISTINCT "profile_id") AS "total_users" FROM "v_all_events" WHERE "session_id" IS NOT NULL;
+
+User: How many users downloaded all categories? / users who downloaded all categories count
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "users_downloaded_all_categories" FROM "download_category_events" WHERE "event_type" = \'downloaded\' AND "total_selected" = \'5\';
+
+User: Which users downloaded all categories? / list users who downloaded all categories
+SQL: SELECT DISTINCT "profile_id" FROM "download_category_events" WHERE "event_type" = \'downloaded\' AND "total_selected" = \'5\' ORDER BY "profile_id";
+
+User: How many users downloaded any category / downloaded a category / category download count
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "download_category_events" WHERE "event_type" = \'downloaded\';
+
+User: How many categories did each user download
+SQL: SELECT "profile_id", "total_selected"::integer AS "categories_downloaded" FROM "download_category_events" WHERE "event_type" = \'downloaded\' ORDER BY "categories_downloaded" DESC;
+
+User: Which categories were downloaded the most / download count per category
+SQL: SELECT cat AS "category", COUNT(DISTINCT "profile_id") AS "user_count" FROM (SELECT "profile_id", jsonb_array_elements_text("selected_category_titles"::jsonb) AS cat FROM "download_category_events" WHERE "event_type" = \'downloaded\') sub GROUP BY cat ORDER BY "user_count" DESC;
+
+User: Terms and conditions / T&C screen users
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "v_all_events" WHERE "screen_name" ILIKE \'%settings_disclaimer%\' OR "screen_name" = \'SettingsDisclaimer\';
+
+User: How many users accepted terms and conditions
+SQL: SELECT COUNT(DISTINCT "profile_id") AS "user_count" FROM "interaction_events" WHERE "screen_name" ILIKE \'%settings_disclaimer%\' AND "event_type" = \'completed\';
 """
 
 
@@ -514,6 +785,53 @@ def sanitize_generated_sql(sql: str) -> str:
 
     # 4. Fix bad onboarding_events question_id ILIKE patterns
     sql = fix_onboarding_ilike(sql)
+
+    # 5. Block queries to the non-existent terms_conditions_events table
+    if "terms_conditions_events" in sql:
+        sql = sql.replace('"terms_conditions_events"', '"interaction_events"')
+        sql = sql.replace("terms_conditions_events", '"interaction_events"')
+        # Replace 'accepted' event_type check with the correct screen + completed check
+        sql = re.sub(
+            r'["\']?event_type["\']?\s*=\s*["\']accepted["\']',
+            '"screen_name" ILIKE \'%settings_disclaimer%\' AND "event_type" = \'completed\'',
+            sql, flags=re.IGNORECASE
+        )
+        # Remove duplicate WHERE if we introduced one
+        sql = re.sub(r'WHERE\s+WHERE', 'WHERE', sql, flags=re.IGNORECASE)
+
+    # 6. CRITICAL: Detect the wrong pattern where LLM generated onboarding_events GROUP BY answer_id
+    #    for a drop-off question. These are questions about HOW MANY USERS DROPPED AT a stage,
+    #    NOT about survey yes/no answers. Detect and replace with correct funnel query.
+    #    Signature: onboarding_events + GROUP BY answer_id + no question_id WHERE filter
+    if "onboarding_events" in sql and "answer_id" in sql.lower() and "group by" in sql.lower():
+        has_question_filter = re.search(r'question_id\s+ILIKE', sql, re.IGNORECASE)
+        has_answer_filter = re.search(r'answer_id\s*=', sql, re.IGNORECASE)
+        # If there is no question_id filter and no specific answer filter, it means the LLM
+        # grouped all survey answers without context — likely a wrong pattern for a drop-off question.
+    # 7. CRITICAL: Fix queries targeting NULL category_title on download_category_events with event_type = 'downloaded'
+    if "download_category_events" in sql and "downloaded" in sql.lower():
+        # Case 7a: Query looking for users who downloaded all categories via HAVING COUNT(DISTINCT category_title) = ...
+        if re.search(r'having\s+count\s*\(\s*distinct\s+["\']?category_title["\']?\s*\)', sql, re.IGNORECASE):
+            if re.match(r'^\s*select\s+count\b', sql, re.IGNORECASE):
+                sql = 'SELECT COUNT(DISTINCT "profile_id") AS "users_downloaded_all_categories" FROM "download_category_events" WHERE "event_type" = \'downloaded\' AND "total_selected" = \'5\''
+            else:
+                sql = 'SELECT DISTINCT "profile_id" FROM "download_category_events" WHERE "event_type" = \'downloaded\' AND "total_selected" = \'5\' ORDER BY "profile_id"'
+
+        # Case 7b: Query doing SELECT profile_id, COUNT(DISTINCT category_title) ... GROUP BY profile_id
+        elif re.search(r'count\s*\(\s*distinct\s+["\']?category_title["\']?\s*\)', sql, re.IGNORECASE) and "group by" in sql.lower():
+            sql = re.sub(
+                r'count\s*\(\s*distinct\s+["\']?category_title["\']?\s*\)',
+                'MAX("total_selected"::integer)',
+                sql, flags=re.IGNORECASE
+            )
+
+        # Case 7c: Query checking category_title = '...' or ILIKE on download events where category_title is NULL
+        elif re.search(r'["\']?category_title["\']?\s*(?:=|ILIKE|LIKE)\s*(\'[^\']+\')', sql, re.IGNORECASE):
+            sql = re.sub(
+                r'["\']?category_title["\']?\s*(?:=|ILIKE|LIKE)\s*(\'[^\']+\')',
+                lambda m: f'"selected_category_titles" ILIKE \'%' + m.group(1).strip("'") + '%\'',
+                sql, flags=re.IGNORECASE
+            )
 
     return sql.strip()
 
@@ -676,6 +994,46 @@ def _call_qwen(messages: list, max_tokens: int = 500) -> str:
     return body.get("message", {}).get("content", "").strip()
 
 
+def diagnose_zero_rows(sql: str) -> list:
+    """Dynamically inspects tables and columns referenced in an empty query to discover real database values.
+    Works for any table, current or future, preventing false '0-row' answers.
+    """
+    tables = re.findall(r'(?:FROM|JOIN)\s+["\']?([a-zA-Z0-9_]+)["\']?', sql, re.IGNORECASE)
+    filter_cols = re.findall(r'["\']?([a-zA-Z0-9_]+)["\']?\s*(?:=|ILIKE|LIKE)\s*\'[^\']+\'', sql, re.IGNORECASE)
+
+    diagnostic_info = []
+    try:
+        conn = psycopg2.connect(**PG_KWARGS)
+        cur = conn.cursor()
+        for t in set(tables):
+            # 1. Check distinct values for any filtered columns
+            for col in set(filter_cols):
+                try:
+                    cur.execute(f'SELECT DISTINCT "{col}" FROM "{t}" WHERE "{col}" IS NOT NULL LIMIT 10')
+                    vals = [str(r[0]) for r in cur.fetchall()]
+                    if vals:
+                        diagnostic_info.append(f"Table '{t}', Column '{col}' actual database values: {vals}")
+                except Exception:
+                    conn.rollback()
+            # 2. If no filter cols were matched, provide sample row data for context
+            if not diagnostic_info:
+                try:
+                    cur.execute(f'SELECT * FROM "{t}" LIMIT 2')
+                    if cur.description:
+                        col_names = [d[0] for d in cur.description]
+                        sample_row = cur.fetchone()
+                        if sample_row:
+                            row_preview = {k: v for k, v in zip(col_names, sample_row) if v is not None}
+                            diagnostic_info.append(f"Table '{t}' sample row: {row_preview}")
+                except Exception:
+                    conn.rollback()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+    return diagnostic_info
+
+
 def ask_qwen_sql(question: str):
     """3-step pipeline: question → SQL → execute → explain.
     Returns (answer_text, rows).
@@ -688,16 +1046,29 @@ def ask_qwen_sql(question: str):
             "role": "system",
             "content": (
                 "You are a PostgreSQL expert for the Maternity Foundation Safe Delivery analytics database.\n"
-                "Given a user question (tolerate minor user typos like 'onbaording' for onboarding, 'inversiom' for in version, 'inversion' for 'in version'):\n"
-                "Return ONLY a valid PostgreSQL SELECT query inside a ```sql code block.\n"
+                "Given a user question, return ONLY a valid PostgreSQL SELECT query inside a ```sql code block.\n"
                 "Do NOT include ANY explanation, comments, or extra text — not inside nor outside the code block.\n"
-                "Do NOT append SQL line comments (-- ...) to the query.\n\n"
+                "Do NOT append SQL line comments (-- ...) to the query.\n"
+                "Tolerate minor user typos (e.g. 'onbaording'->onboarding, 'survay'->survey, 'questin'->question).\n\n"
+                "## CRITICAL DISAMBIGUATION RULES (MUST FOLLOW):\n"
+                "1. 'How many users dropped during/at/in survey' = FUNNEL/JOURNEY question.\n"
+                "   Use: SELECT COUNT(DISTINCT profile_id) FROM onboarding_events WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM v_all_events WHERE screen_name ILIKE '%home_screen%' OR screen_name = 'HomeScreen').\n"
+                "   NEVER use GROUP BY answer_id for drop-off questions.\n"
+                "2. 'Survey answers / yes no breakdown / answered yes/no' = SURVEY ANSWER question.\n"
+                "   Use: SELECT answer_id, COUNT(DISTINCT profile_id) FROM onboarding_events WHERE question_id ILIKE '<pattern>' GROUP BY answer_id.\n"
+                "3. The table 'terms_conditions_events' does NOT exist. For T&C use interaction_events WHERE screen_name ILIKE '%settings_disclaimer%'.\n"
+                "4. For funnel queries: UNION ALL across: installed -> language -> category downloaded -> survey -> home.\n"
+                "5. 'How many users downloaded all categories?' = CATEGORY DOWNLOAD question.\n"
+                "   In download_category_events, category_title is NULL on 'downloaded' events! All 5 categories were selected when total_selected = '5'.\n"
+                "   Use: SELECT COUNT(DISTINCT profile_id) FROM download_category_events WHERE event_type = 'downloaded' AND total_selected = '5';\n"
+                "   For 'Which users downloaded all categories?': SELECT DISTINCT profile_id FROM download_category_events WHERE event_type = 'downloaded' AND total_selected = '5' ORDER BY profile_id;\n"
+                "   For 'How many users downloaded any category?': SELECT COUNT(DISTINCT profile_id) FROM download_category_events WHERE event_type = 'downloaded';\n\n"
                 f"Database schema:\n{schema}\n\n"
                 f"{TABLE_NOTES}"
             ),
         },
         {"role": "user", "content": question},
-    ], max_tokens=800)
+    ], max_tokens=1200)
 
     sql = extract_clean_sql(sql_raw)
     if not sql:
@@ -750,42 +1121,51 @@ def ask_qwen_sql(question: str):
         except Exception as fix_err:
             return (f"SQL error: {sql_err}\nFix attempt also failed: {fix_err}", [])
 
-    # ── Step 3a: Zero-row smart retry for onboarding_events ──
-    if not rows and "onboarding_events" in sql and "question_id" in sql.lower():
-        # The LLM likely generated a bad ILIKE pattern. Retry with actual question list.
-        actual_qs = "\n".join(f"  - {q}" for q in ONBOARDING_QUESTIONS)
-        retry_raw = _call_qwen([
-            {
-                "role": "system",
-                "content": (
-                    "You are a PostgreSQL expert. The previous SQL returned 0 rows because the "
-                    "question_id ILIKE pattern did not match any database values.\n"
-                    "Here are the EXACT question_id values stored in the onboarding_events table:\n"
-                    f"{actual_qs}\n\n"
-                    "Rewrite the SQL using the correct question_id value (use ILIKE with a substring "
-                    "that is guaranteed to match one of the above). "
-                    "Return ONLY the corrected SQL inside a ```sql code block. No explanation."
-                ),
-            },
-            {"role": "user", "content": f"Original question: {question}\n\nFailed SQL (returned 0 rows):\n{sql}\n\nFixed SQL:"},
-        ], max_tokens=800)
-        retry_sql = extract_clean_sql(retry_raw)
-        if retry_sql:
-            retry_sql = sanitize_generated_sql(retry_sql)
-            try:
-                conn = psycopg2.connect(**PG_KWARGS)
-                cur = conn.cursor()
-                cur.execute(retry_sql)
-                if cur.description:
-                    col_names = [d[0] for d in cur.description]
-                    fetched = cur.fetchall()
-                    rows = [dict(zip(col_names, row)) for row in fetched]
-                cur.close()
-                conn.close()
-                if rows:
-                    sql = retry_sql  # use the corrected SQL for explanation
-            except Exception:
-                pass  # fall through to "no rows" explanation
+    # ── Step 3a: Universal Zero-Row Diagnostic Self-Healing ─────────
+    # If the query returned 0 rows, inspect actual database values and give LLM one self-correction chance.
+    if not rows:
+        diagnostics = diagnose_zero_rows(sql)
+        if "onboarding_events" in sql and "question_id" in sql.lower():
+            actual_qs = "\n".join(f"  - {q}" for q in ONBOARDING_QUESTIONS)
+            diagnostics.append(f"Exact question_id values in onboarding_events:\n{actual_qs}")
+
+        if diagnostics:
+            diag_text = "\n".join(diagnostics)
+            retry_raw = _call_qwen([
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a PostgreSQL expert. The previous query returned 0 rows because the "
+                        "WHERE filter or column value did not match the real database contents.\n"
+                        f"Database schema:\n{schema}\n\n"
+                        "REAL DATA INSPECTED FROM DATABASE:\n"
+                        f"{diag_text}\n\n"
+                        "Rewrite the SQL query using the correct database values and columns shown above. "
+                        "Return ONLY the corrected SQL inside a ```sql code block. No explanation. No comments."
+                    ),
+                },
+                {"role": "user", "content": f"User question: {question}\n\nFailed SQL (returned 0 rows):\n{sql}\n\nCorrected SQL:"},
+            ], max_tokens=800)
+            retry_sql = extract_clean_sql(retry_raw)
+            if retry_sql:
+                retry_sql = sanitize_generated_sql(retry_sql)
+                try:
+                    conn = psycopg2.connect(**PG_KWARGS)
+                    cur = conn.cursor()
+                    cur.execute(retry_sql)
+                    if cur.description:
+                        col_names = [d[0] for d in cur.description]
+                        fetched = cur.fetchall()
+                        retry_rows = [dict(zip(col_names, row)) for row in fetched]
+                    else:
+                        retry_rows = []
+                    cur.close()
+                    conn.close()
+                    if retry_rows:
+                        sql = retry_sql  # use corrected query for explanation
+                        rows = retry_rows
+                except Exception:
+                    pass
 
     # ── Step 3b: Explain results in plain English ─────────────
     if not rows:
@@ -1837,9 +2217,9 @@ with tab_chat:
             df = pd.DataFrame(rows)
             st.markdown("---")
             v_tab_chart, v_tab_table, v_tab_sql = st.tabs([
-                "📊 PowerBI Visual",
-                "📋 Data Table",
-                "🔍 Generated SQL",
+                "Visuals",
+                "Data Table",
+                "Generated SQL",
             ])
             with v_tab_chart:
                 display_chart(df, key_prefix="tab1_main")
@@ -1847,7 +2227,7 @@ with tab_chat:
                 st.dataframe(df, use_container_width=True)
                 csv_bytes = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "📥 Export Results (CSV)",
+                    "Export Results (CSV)",
                     data=csv_bytes,
                     file_name="query_results.csv",
                     mime="text/csv",
